@@ -28,7 +28,18 @@ def main() -> int:
             break
         if not question.strip():
             break
-        print(answer_question(client, model, instructions, backend, history, question))
+        result = answer_question(client, model, instructions, backend, history, question)
+        if result.text:
+            print(result.text)
+        if result.usage_known:
+            print(
+                f"tokens: {result.input_tokens} in / "
+                f"{result.output_tokens} out / {result.total_tokens} total"
+            )
+        else:
+            print("tokens: n/a")
+        if result.record_path:
+            print(f"Record: {result.record_path}")
     backend.close()
     return 0
 

@@ -6,7 +6,7 @@ import json
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from agent.backend import DatabaseBackend
+    from agent.tools import ToolContext
 
 NAME = "list_tables"
 
@@ -24,5 +24,5 @@ SCHEMA: dict[str, Any] = {
 }
 
 
-def run(backend: DatabaseBackend, _args: dict[str, Any]) -> str:
-    return json.dumps({"tables": backend.list_tables()})
+def run(ctx: ToolContext, _args: dict[str, Any]) -> str:
+    return json.dumps({"tables": ctx.backend.list_tables()})
