@@ -19,9 +19,9 @@ from agent.tools import TOOL_SCHEMAS, ToolContext, dispatch
 
 MODEL_DEFAULT = "muse-spark-1.3-contributor"
 BASE_URL = "https://api.meta.ai/v1"
-MAX_TURNS = 12
+MAX_TURNS = 16
 REMINDER_TURNS = 3
-CAP_MESSAGE = "Reached the 12-turn limit without a final answer."
+CAP_MESSAGE = "Reached the 16-turn limit without a final answer."
 SUBMIT_REMINDER = (
     "You replied in plain text without submitting. Record a finding for "
     "each key number with record_finding, then call submit_answer. "
@@ -220,6 +220,8 @@ def answer_question(
             del history[snapshot:]
             api_failed = True
             break
+        if ctx.record is not None and ctx.record.submission is not None:
+            break
         if not had_calls:
             break
     else:
@@ -246,7 +248,7 @@ def answer_question(
                 break
     submission = ctx.record.submission if ctx.record is not None else None
     record_path = _record_display_path(ctx.record.path) if ctx.record else None
-    if capped:
+    if capped and submission is None:
         return TurnResult(
             text=CAP_MESSAGE,
             input_tokens=usage.input_tokens,

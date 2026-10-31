@@ -109,18 +109,23 @@ def run(ctx: ToolContext, args: dict[str, Any]) -> str:
     ]
     if uncovered:
         reason = f"uncovered checklist items: {uncovered}"
-        return _reject(record, reason, [], answer)
+        return _reject(record, reason, [], answer, assumptions, gaps)
     cells = [v for q in record.queries for row in q["rows"] for v in row]
     matched, unmatched = verify_text(answer, record.question, cells)
     if unmatched:
         reason = f"unmatched numbers: {unmatched}"
-        return _reject(record, reason, unmatched, answer)
+        return _reject(record, reason, unmatched, answer, assumptions, gaps)
     result = record.submit(answer, assumptions, gaps, matched, unmatched)
     return json.dumps(result)
 
 
 def _reject(
-    record, reason: str, unmatched: list[str], answer: str
+    record,
+    reason: str,
+    unmatched: list[str],
+    answer: str,
+    assumptions: list[str],
+    gaps: list[dict[str, str]],
 ) -> str:
     """Count the rejection; escalate-accept once the limit is reached."""
     total = record.note_rejection(reason, unmatched)
@@ -128,8 +133,8 @@ def _reject(
         warning = f"UNVERIFIED NUMBERS: {unmatched or reason}"
         result = record.submit(
             answer,
-            assumptions=[],
-            gaps=[],
+            assumptions=list(assumptions),
+            gaps=list(gaps),
             matched=[],
             unmatched=list(unmatched),
             status=STATUS_ESCALATED,

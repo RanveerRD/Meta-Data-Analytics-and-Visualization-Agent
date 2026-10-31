@@ -11,10 +11,31 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 # A number with optional commas, decimals, and a trailing percent sign.
 # A trailing dot only counts when a digit follows it, so list numbering
-# like "1." is never extracted.
-_NUMBER_RE = re.compile(r"-?(?:\d[\d,]*)(?:\.\d+)?%?")
+# like "1." is never extracted. The sign is handled separately: a hyphen
+# counts as minus only at the start or after whitespace or "(".
+_NUMBER_RE = re.compile(r"(?:\d[\d,]*)(?:\.\d+)?%?")
 _CURRENCY_PREFIX_RE = re.compile(r"^[$€£]")
 _TRAILING_NON_DIGIT_RE = re.compile(r"[.%]$")
+
+# ISO dates, year-months, and clock times are not number claims. Full dates
+# come first so a YYYY-MM inside a date is consumed as part of it. Month,
+# day, hour, and minute/second ranges are validated so values like
+# "2017-2018" or "25:99" fall through to the normal number rules instead
+# of being silently masked.
+_MASK_RE = re.compile(
+    r"\b\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])\b"
+    r"|\b\d{4}-(?:0[1-9]|1[0-2])\b"
+    r"|\b(?:[01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d)?\b"
+)
+
+
+def _mask_dates_and_times(text: str) -> str:
+    """Blank out date/time spans with spaces, preserving positions."""
+
+    def _spaces(match: re.Match[str]) -> str:
+        return " " * (match.end() - match.start())
+
+    return _MASK_RE.sub(_spaces, text)
 
 
 def extract_numbers(text: str) -> list[str]:
@@ -22,19 +43,26 @@ def extract_numbers(text: str) -> list[str]:
 
     List numbering like "1." at the start of a line is not a number claim
     and is skipped; a trailing period anywhere else is sentence punctuation.
+    A hyphen between two digits is a range separator, not a minus sign.
     """
+    text = _mask_dates_and_times(text)
     tokens: list[str] = []
     for match in _NUMBER_RE.finditer(text):
         token = match.group(0)
-        if token in {"-", "%"}:
-            continue
+        start = match.start()
+        if (
+            start > 0
+            and text[start - 1] == "-"
+            and (start - 1 == 0 or text[start - 2] in " \t\n\r\f\v(")
+        ):
+            token = "-" + token
         end = match.end()
-        line_start = text.rfind("\n", 0, match.start()) + 1
+        line_start = text.rfind("\n", 0, start) + 1
         if (
             token.isdigit()
             and end < len(text)
             and text[end] == "."
-            and not text[line_start : match.start()].strip()
+            and not text[line_start:start].strip()
         ):
             continue
         tokens.append(token)

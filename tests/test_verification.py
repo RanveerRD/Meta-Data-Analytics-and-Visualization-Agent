@@ -231,12 +231,18 @@ def test_submit_escalated_after_three_rejections():
                     {"item_id": item_id, "claim": "c", "query_id": "q1", "value": value},
                 )
             last = {}
+            submitted_assumptions = ["All statuses included."]
+            submitted_gaps = [{"item_id": "", "note": "Date range unclear."}]
             for _ in range(3):
                 last = json.loads(
                     dispatch(
                         ctx,
                         "submit_answer",
-                        {"answer": "Total is 9.", "assumptions": [], "gaps": []},
+                        {
+                            "answer": "Total is 9.",
+                            "assumptions": submitted_assumptions,
+                            "gaps": submitted_gaps,
+                        },
                     )
                 )
             assert last["ok"] is True
@@ -245,6 +251,8 @@ def test_submit_escalated_after_three_rejections():
             assert "9" in last["warning"]
             assert ctx.record.submission["status"] == "escalated"
             assert ctx.record.rejections == 3
+            assert ctx.record.submission["assumptions"] == submitted_assumptions
+            assert ctx.record.submission["gaps"] == submitted_gaps
         finally:
             backend.close()
 
@@ -253,6 +261,30 @@ def test_years_and_list_numbering_ignored():
     assert extract_numbers("1. First\n2. Second") == []
     matched, unmatched = verify_text(
         "In 2024:\n1. Total\nThe total is 5.", "How many?", [5]
+    )
+    assert matched == ["5"]
+    assert unmatched == []
+
+
+def test_iso_dates_and_times_produce_no_numbers():
+    assert extract_numbers("from 2017-01-01 to 2017-12-31") == []
+    assert extract_numbers("in 2017-01") == []
+    assert extract_numbers("at 10:30:00") == []
+    assert extract_numbers("at 10:30") == []
+    matched, unmatched = verify_text(
+        "From 2017-01-01 to 2017-12-31.", "Over what period?", [99441]
+    )
+    assert matched == []
+    assert unmatched == []
+
+
+def test_hyphen_between_digits_is_a_range_separator():
+    assert extract_numbers("2017-2018") == ["2017", "2018"]
+    assert extract_numbers("10-20") == ["10", "20"]
+    assert extract_numbers("-5.2") == ["-5.2"]
+    assert extract_numbers("(-5.2)") == ["-5.2"]
+    matched, unmatched = verify_text(
+        "Total is 5 from 2017-01-01 to 2017-12-31.", "How many?", [5]
     )
     assert matched == ["5"]
     assert unmatched == []
@@ -402,6 +434,70 @@ def test_loop_plain_text_without_record():
             assert result.text == "Yes, all statuses."
             assert result.record_path is None
             assert result.verification is None
+        finally:
+            backend.close()
+
+
+
+
+def test_acceptance_on_final_round_returns_answer_not_cap():
+    with tempfile.TemporaryDirectory() as tmp:
+        backend = _stub_backend(tmp)
+        try:
+            script = [
+                _response(
+                    _call("c1", "set_checklist", {"items": [
+                        {"id": "n", "question": "How many?", "evidence_needed": "count"}]}),
+                    _call("c2", "update_plan", {"plan": [
+                        {"item_id": "n", "steps": ["count"]}]})),
+            ]
+            for i in range(1, 14):
+                script.append(_response(_call(f"g{i}", "get_schema", {"table": "items"})))
+            script += [
+                _response(
+                    _call("c15a", "run_sql", {"query": "SELECT count(*) FROM items;"}),
+                    _call("c15b", "record_finding", {
+                        "item_id": "n", "claim": "3 items", "query_id": "q1", "value": 3}),
+                ),
+                _response(_call("c16", "submit_answer", {
+                    "answer": "There are 3 items.",
+                    "assumptions": ["All rows counted."],
+                    "gaps": []})),
+            ]
+            assert len(script) == 16
+            client = _StubClient(script)
+            result = answer_question(
+                client, "m", "instr", backend, [], "How many?",
+                runs_dir=Path(tmp) / "runs",
+            )
+            assert result.text == "There are 3 items."
+            assert "Reached the" not in result.text
+            assert client.calls == 16
+            assert result.verification == "verification: 1 numbers matched, 0 unmatched"
+        finally:
+            backend.close()
+
+
+def test_no_calls_after_early_acceptance():
+    with tempfile.TemporaryDirectory() as tmp:
+        backend = _stub_backend(tmp)
+        try:
+            script = [
+                _response(_call("c1", "set_checklist", {"items": [{"id": "n", "question": "How many?", "evidence_needed": "count"}]})),
+                _response(_call("c2", "update_plan", {"plan": [{"item_id": "n", "steps": ["count"]}]})),
+                _response(_call("c3", "get_schema", {"table": "items"})),
+                _response(_call("c4", "run_sql", {"query": "SELECT count(*) FROM items;"})),
+                _response(_call("c5", "record_finding", {"item_id": "n", "claim": "3 items", "query_id": "q1", "value": 3})),
+                _response(_call("c6", "submit_answer", {"answer": "There are 3 items.", "assumptions": ["All rows counted."], "gaps": []})),
+            ]
+            assert len(script) == 6
+            client = _StubClient(script)
+            result = answer_question(
+                client, "m", "instr", backend, [], "How many?",
+                runs_dir=Path(tmp) / "runs",
+            )
+            assert result.text == "There are 3 items."
+            assert client.calls == 6
         finally:
             backend.close()
 
