@@ -40,6 +40,8 @@ def main() -> int:
             print("tokens: n/a")
         if result.record_path:
             print(f"Record: {result.record_path}")
+        if result.verification:
+            print(result.verification)
     backend.close()
     return 0
 

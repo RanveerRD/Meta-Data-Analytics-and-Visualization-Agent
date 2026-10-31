@@ -40,12 +40,14 @@ def _ctx(backend: SqliteBackend, tmp: str, question: str = "how many?") -> ToolC
     return ToolContext(backend=backend, question=question, runs_dir=Path(tmp) / "runs")
 
 
-def test_registry_lists_all_five_tools():
+def test_registry_lists_all_seven_tools():
     assert sorted(s["name"] for s in TOOL_SCHEMAS) == [
         "get_schema",
         "list_tables",
+        "record_finding",
         "run_sql",
         "set_checklist",
+        "submit_answer",
         "update_plan",
     ]
 
@@ -180,6 +182,8 @@ def test_tools_never_import_a_database_driver():
         "run_sql.py",
         "set_checklist.py",
         "update_plan.py",
+        "record_finding.py",
+        "submit_answer.py",
     ):
         text = (tools_dir / module).read_text()
         assert "sqlite3" not in text, f"{module} touches a database driver"

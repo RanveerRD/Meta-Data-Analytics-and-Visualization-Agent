@@ -19,6 +19,12 @@ from typing import Any
 STATUS_OPEN = "open"
 STATUS_PROVEN = "proven"
 
+STATUS_ANSWERED = "answered"
+STATUS_ESCALATED = "escalated"
+
+MAX_FINDINGS_PER_ITEM = 3
+TOLERANCE = 0.005
+
 _ID_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 
@@ -145,6 +151,22 @@ class AnalysisRecord:
         return copy.deepcopy(self._state["findings"])
 
     @property
+    def rejected(self) -> list[dict[str, Any]]:
+        return copy.deepcopy(self._state.get("rejected", []))
+
+    @property
+    def submission(self) -> dict[str, Any] | None:
+        return copy.deepcopy(self._state.get("submission"))
+
+    @property
+    def rejections(self) -> int:
+        return int(self._state.get("rejections", 0))
+
+    @property
+    def question(self) -> str:
+        return self._question
+
+    @property
     def audit(self) -> list[dict[str, Any]]:
         return copy.deepcopy(self._state["audit"])
 
@@ -156,10 +178,20 @@ class AnalysisRecord:
         return required == {p["item_id"] for p in self._state["plan"]}
 
     def set_checklist(self, items: Any) -> AnalysisRecord:
-        """Replace the checklist (and reset plan plus queries); save."""
+        """Replace the checklist and plan, keep recorded queries, save.
+
+        Findings for items that no longer exist are dropped; the rejected
+        list is append-only history and stays. A prior submission belongs to
+        the old checklist, so it and the rejection counter reset.
+        """
         self._state["checklist"] = validate_checklist_items(items)
         self._state["plan"] = []
-        self._state["queries"] = []
+        kept = {c["id"] for c in self._state["checklist"]}
+        self._state["findings"] = [
+            f for f in self._state["findings"] if f["item_id"] in kept
+        ]
+        self._state["submission"] = None
+        self._state["rejections"] = 0
         self._append_audit("set_checklist", {"items": [c["id"] for c in self._state["checklist"]]})
         self.save()
         return self
@@ -190,6 +222,120 @@ class AnalysisRecord:
         self.save()
         return query_id
 
+    def item_ids(self) -> list[str]:
+        """Ids on the current checklist."""
+        return [c["id"] for c in self._state["checklist"]]
+
+    def is_proven(self, item_id: str) -> bool:
+        """True when the item has at least one accepted finding."""
+        return any(
+            c["id"] == item_id and c["status"] == STATUS_PROVEN
+            for c in self._state["checklist"]
+        )
+
+    def _check_finding_refusal(self, item_id: Any, query_id: Any, value: Any) -> str | None:
+        """Return the refusal reason, or None when the finding may be stored."""
+        known_items = {c["id"] for c in self._state["checklist"]}
+        if item_id not in known_items:
+            return f"unknown checklist item: {item_id!r}"
+        known_queries = {q["id"] for q in self._state["queries"]}
+        if query_id not in known_queries:
+            return f"unknown query id: {query_id!r}"
+        if value is None:
+            return "finding needs a value"
+        if sum(1 for f in self._state["findings"] if f["item_id"] == item_id) >= MAX_FINDINGS_PER_ITEM:
+            return f"checklist item {item_id!r} already has {MAX_FINDINGS_PER_ITEM} findings"
+        query = next(q for q in self._state["queries"] if q["id"] == query_id)
+        if not _value_in_rows(value, [v for row in query["rows"] for v in row]):
+            return f"value {value!r} does not appear in {query_id}'s stored result"
+        return None
+
+    def record_finding(
+        self, item_id: str, claim: str, query_id: str, value: Any
+    ) -> dict[str, Any]:
+        """Store a verified finding, or refuse with a reason. Always audited."""
+        if not isinstance(claim, str) or not claim.strip():
+            return self._refuse_finding(item_id, claim, query_id, value, "finding needs a claim")
+        reason = self._check_finding_refusal(item_id, query_id, value)
+        if reason is not None:
+            return self._refuse_finding(item_id, claim, query_id, value, reason)
+        self._state["findings"].append(
+            {
+                "item_id": item_id,
+                "claim": claim.strip(),
+                "query_id": query_id,
+                "value": value,
+                "timestamp": _utc_now_iso(),
+            }
+        )
+        for entry in self._state["checklist"]:
+            if entry["id"] == item_id:
+                entry["status"] = STATUS_PROVEN
+        self._append_audit("record_finding", {"item_id": item_id, "query_id": query_id})
+        self.save()
+        return {"ok": True, "item_id": item_id, "status": STATUS_PROVEN}
+
+    def _refuse_finding(
+        self, item_id: Any, claim: Any, query_id: Any, value: Any, reason: str
+    ) -> dict[str, Any]:
+        self._state.setdefault("rejected", []).append(
+            {
+                "tool": "record_finding",
+                "item_id": item_id,
+                "claim": claim,
+                "query_id": query_id,
+                "value": value,
+                "reason": reason,
+                "timestamp": _utc_now_iso(),
+            }
+        )
+        self._append_audit("finding_rejected", {"item_id": item_id, "reason": reason})
+        self.save()
+        return {"error": reason}
+
+    def submit(
+        self,
+        answer: str,
+        assumptions: Any,
+        gaps: Any,
+        matched: list[str],
+        unmatched: list[str],
+        status: str = STATUS_ANSWERED,
+    ) -> dict[str, Any]:
+        """Store the accepted answer. Called only after all gates pass."""
+        submission = {
+            "answer": answer,
+            "assumptions": list(assumptions),
+            "gaps": list(gaps),
+            "rejections": self.rejections,
+            "status": status,
+            "matched": list(matched),
+            "unmatched": list(unmatched),
+            "timestamp": _utc_now_iso(),
+        }
+        self._state["submission"] = submission
+        self._append_audit(
+            "submit_answer",
+            {"status": status, "unmatched": list(unmatched)},
+        )
+        self.save()
+        return {"ok": True, **submission}
+
+    def note_rejection(self, reason: str, unmatched: list[str]) -> int:
+        """Count a submit_answer rejection; return the new total."""
+        self._state["rejections"] = self.rejections + 1
+        self._state.setdefault("rejected", []).append(
+            {
+                "tool": "submit_answer",
+                "reason": reason,
+                "unmatched": list(unmatched),
+                "timestamp": _utc_now_iso(),
+            }
+        )
+        self._append_audit("submit_rejected", {"reason": reason, "unmatched": list(unmatched)})
+        self.save()
+        return self.rejections
+
     def save(self) -> Path:
         """Persist atomically: temp file, flush, fsync, rename."""
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -215,8 +361,41 @@ class AnalysisRecord:
             "plan": self._state["plan"],
             "queries": self._state["queries"],
             "findings": self._state["findings"],
+            "rejected": self._state.get("rejected", []),
+            "submission": self._state.get("submission"),
+            "rejections": self._state.get("rejections", 0),
             "audit": self._state["audit"],
         }
+
+
+def _value_in_rows(value: Any, cells: list[Any]) -> bool:
+    """True when a stored cell matches the claimed value.
+
+    Numbers compare with tolerance 0.005; anything else compares exact.
+    """
+    if isinstance(value, bool):
+        return any(cell is value for cell in cells)
+    if isinstance(value, (int, float)):
+        target = float(value)
+        for cell in cells:
+            if isinstance(cell, bool):
+                continue
+            if isinstance(cell, (int, float)) and abs(float(cell) - target) <= TOLERANCE:
+                return True
+        return False
+    if isinstance(value, str):
+        text = value.strip().replace(",", "")
+        try:
+            target = float(text)
+        except ValueError:
+            return any(cell == value for cell in cells if isinstance(cell, str))
+        for cell in cells:
+            if isinstance(cell, bool):
+                continue
+            if isinstance(cell, (int, float)) and abs(float(cell) - target) <= TOLERANCE:
+                return True
+        return False
+    return any(cell == value for cell in cells)
 
 
 def _blank_state(question: str) -> dict[str, Any]:
@@ -226,5 +405,8 @@ def _blank_state(question: str) -> dict[str, Any]:
         "plan": [],
         "queries": [],
         "findings": [],
+        "rejected": [],
+        "submission": None,
+        "rejections": 0,
         "audit": [],
     }

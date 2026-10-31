@@ -33,9 +33,25 @@ class ToolContext:
 
 
 def _tool_modules() -> tuple:
-    from agent.tools import get_schema, list_tables, run_sql, set_checklist, update_plan
+    from agent.tools import (
+        get_schema,
+        list_tables,
+        record_finding,
+        run_sql,
+        set_checklist,
+        submit_answer,
+        update_plan,
+    )
 
-    return (list_tables, get_schema, set_checklist, update_plan, run_sql)
+    return (
+        list_tables,
+        get_schema,
+        set_checklist,
+        update_plan,
+        record_finding,
+        run_sql,
+        submit_answer,
+    )
 
 
 _TOOL_MODULES = _tool_modules()
