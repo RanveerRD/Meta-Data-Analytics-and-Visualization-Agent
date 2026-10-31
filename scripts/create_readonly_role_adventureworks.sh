@@ -122,17 +122,20 @@ else
   check_fail "6. pg_sleep(15) cancelled" "expected timeout (57014), got: $first_line"
 fi
 
-# 7. No INSERT privilege via has_table_privilege.
-if priv="$(psql -d "$DB" -tAc "SELECT has_table_privilege('analyst_reader','$TABLE','INSERT');" 2>&1)"; then
-  priv_trimmed="$(echo "$priv" | tr -d '[:space:]')"
-  if [ "$priv_trimmed" = "f" ]; then
-    check_pass "7. has_table_privilege INSERT is false" "returned f"
+# 7. No write privileges via has_table_privilege (permission layer, independent
+# of default_transaction_read_only).
+for priv in INSERT UPDATE DELETE TRUNCATE; do
+  if priv_out="$(psql -d "$DB" -tAc "SELECT has_table_privilege('analyst_reader','$TABLE','$priv');" 2>&1)"; then
+    priv_trimmed="$(echo "$priv_out" | tr -d '[:space:]')"
+    if [ "$priv_trimmed" = "f" ]; then
+      check_pass "7. has_table_privilege $priv is false" "returned f"
+    else
+      check_fail "7. has_table_privilege $priv is false" "returned $priv_trimmed"
+    fi
   else
-    check_fail "7. has_table_privilege INSERT is false" "returned $priv_trimmed"
+    check_fail "7. has_table_privilege $priv is false" "query failed"
   fi
-else
-  check_fail "7. has_table_privilege INSERT is false" "query failed"
-fi
+done
 
 if [ "$FAILS" -gt 0 ]; then
   echo "$FAILS check(s) FAILED" >&2
