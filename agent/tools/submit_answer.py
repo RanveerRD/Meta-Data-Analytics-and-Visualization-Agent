@@ -98,6 +98,13 @@ def run(ctx: ToolContext, args: dict[str, Any]) -> str:
         not isinstance(a, str) for a in assumptions
     ):
         return json.dumps({"error": "assumptions must be a list of strings"})
+    if not any(a.strip() for a in assumptions):
+        return json.dumps(
+            {
+                "error": "submit_answer needs at least one assumption: "
+                "state the order-status and date-range choices explicitly"
+            }
+        )
     gaps = _validate_gaps(args.get("gaps", []), record.item_ids())
     if isinstance(gaps, str):
         return json.dumps({"error": gaps})

@@ -134,6 +134,70 @@ def _record_display_path(path: Path) -> str:
         return str(path)
 
 
+EVIDENCE_QUESTION = "Want the evidence behind these assumptions?"
+
+
+def render_answer(submission: dict[str, Any]) -> str:
+    """Render the accepted answer with its assumptions and gaps.
+
+    The Gaps section is always present; with no gaps found it reads
+    "- none found".
+    """
+    lines = [submission["answer"], "", "Assumptions:"]
+    lines.extend(f"- {a}" for a in submission["assumptions"])
+    lines.append("")
+    lines.append("Gaps:")
+    gaps = [g for g in submission["gaps"] if g.get("note", "").strip()]
+    if gaps:
+        for gap in gaps:
+            item_id = (gap.get("item_id") or "").strip()
+            if item_id:
+                lines.append(f"- {item_id}: {gap['note'].strip()}")
+            else:
+                lines.append(f"- {gap['note'].strip()}")
+    else:
+        lines.append("- none found")
+    lines.extend(["", EVIDENCE_QUESTION])
+    return "\n".join(lines)
+
+
+def _build_work_summary(ctx: ToolContext) -> str:
+    """Compact summary of this turn's verified work for future context."""
+    record = ctx.record
+    assert record is not None
+    lines = [f"Work summary (record {record.run_id}):", "Checklist:"]
+    for item in record.checklist:
+        lines.append(f"- {item['id']}: {item['question']} [{item['status']}]")
+    lines.append("Queries:")
+    for query in record.queries:
+        sql = query["sql"]
+        if len(sql) > 300:
+            sql = sql[:300] + "..."
+        lines.append(f"- {query['id']}: {sql} ({query['row_count']} rows)")
+    lines.append("Findings:")
+    for finding in record.findings:
+        lines.append(f"- {finding['item_id']}: {finding['claim']} [{finding['query_id']}]")
+    return "\n".join(lines)
+
+
+def _compact_turn_history(
+    history: list[dict[str, Any]],
+    snapshot: int,
+    ctx: ToolContext,
+    text: str,
+) -> None:
+    """Replace this turn's tool traffic with question, summary, and answer.
+
+    Raw schema outputs and result rows are dropped; the full detail stays in
+    the record on disk. The rendered answer keeps the assumptions in context
+    for follow-up questions.
+    """
+    del history[snapshot:]
+    history.append({"role": "user", "content": ctx.question})
+    history.append({"role": "assistant", "content": _build_work_summary(ctx)})
+    history.append({"role": "assistant", "content": text})
+
+
 def _round(
     client: OpenAI,
     model: str,
@@ -263,16 +327,17 @@ def answer_question(
     verification: str | None = None
     if ctx.record is not None:
         if submission is not None:
-            text = submission["answer"]
+            text = render_answer(submission)
             verification = (
                 f"verification: {len(submission['matched'])} numbers matched, "
                 f"{len(submission['unmatched'])} unmatched"
             )
+            _compact_turn_history(history, snapshot, ctx, text)
         else:
             text = last_text
             verification = "verification: no submitted answer"
-        if text:
-            history.append({"role": "assistant", "content": text})
+            if text:
+                history.append({"role": "assistant", "content": text})
     else:
         text = last_text
         if text:

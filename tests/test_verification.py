@@ -19,7 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from agent.backend import SqliteBackend  # noqa: E402
-from agent.loop import answer_question  # noqa: E402
+from agent.loop import answer_question, render_answer  # noqa: E402
 from agent.numbers import extract_numbers, verify_text  # noqa: E402
 from agent.tools import TOOL_SCHEMAS, ToolContext, dispatch  # noqa: E402
 
@@ -171,7 +171,7 @@ def test_submit_refused_uncovered_item():
                 dispatch(
                     ctx,
                     "submit_answer",
-                    {"answer": "Total is 498440.43.", "assumptions": [], "gaps": []},
+                    {"answer": "Total is 498440.43.", "assumptions": ["All rows counted."], "gaps": []},
                 )
             )
             assert "uncovered" in result["error"] and "top_region" in result["error"]
@@ -195,7 +195,7 @@ def test_submit_refused_unmatched_number_then_accepted():
                 dispatch(
                     ctx,
                     "submit_answer",
-                    {"answer": "Total is 498440.43 plus 7 bonus.", "assumptions": [], "gaps": []},
+                    {"answer": "Total is 498440.43 plus 7 bonus.", "assumptions": ["All rows counted."], "gaps": []},
                 )
             )
             assert refused["unmatched"] == ["7"]
@@ -290,6 +290,101 @@ def test_hyphen_between_digits_is_a_range_separator():
     assert unmatched == []
 
 
+def test_identifiers_are_not_number_claims():
+    assert extract_numbers("order d6160fb7873f shipped") == []
+    assert extract_numbers("sku123") == []
+    assert extract_numbers("the 3rd item") == []
+    assert extract_numbers("6160fb78") == []
+
+
+def test_single_letter_suffix_is_extracted():
+    assert extract_numbers("13.6M") == ["13.6"]
+    matched, unmatched = verify_text("It is 13.6M.", "How big?", [5])
+    assert matched == []
+    assert unmatched == ["13.6"]
+
+
+def test_real_numbers_next_to_words_still_count():
+    assert extract_numbers("35 units") == ["35"]
+    assert extract_numbers("8.1%") == ["8.1%"]
+    assert extract_numbers("$48,899.34") == ["48,899.34"]
+
+
+def test_quoted_result_identifier_passes():
+    matched, unmatched = verify_text(
+        'The product_id is "d6160fb7873f".', "Which product?", ["d6160fb7873f", 5]
+    )
+    assert matched == []
+    assert unmatched == []
+
+
+def test_made_up_id_yields_no_numbers():
+    assert extract_numbers("order deadbeef99") == []
+    matched, unmatched = verify_text("order deadbeef99 shipped", "Q?", [5])
+    assert matched == []
+    assert unmatched == []
+
+
+def test_quoted_result_string_with_digits_is_masked():
+    matched, unmatched = verify_text("Code 12 AB done.", "Q?", ["12 AB"])
+    assert matched == []
+    assert unmatched == []
+
+
+def test_touching_occurrence_is_not_masked():
+    matched, unmatched = verify_text("Code 12 ABx done.", "Q?", ["12 AB"])
+    assert matched == []
+    assert unmatched == ["12"]
+
+
+def test_short_text_cell_does_not_swallow_numbers():
+    matched, unmatched = verify_text("Total is 1,234.", "How much?", ["1", 1234])
+    assert matched == ["1,234"]
+    assert unmatched == []
+
+
+def test_render_answer_without_gaps():
+    assert render_answer({"answer": "A.", "assumptions": ["X.", "Y."], "gaps": []}) == (
+        "A.\n\nAssumptions:\n- X.\n- Y.\n\nGaps:\n- none found\n\n"
+        "Want the evidence behind these assumptions?"
+    )
+
+
+def test_render_answer_with_gaps():
+    assert render_answer(
+        {
+            "answer": "A.",
+            "assumptions": ["X."],
+            "gaps": [
+                {"item_id": "n", "note": "Need cost."},
+                {"item_id": "", "note": "General."},
+            ],
+        }
+    ) == (
+        "A.\n\nAssumptions:\n- X.\n\nGaps:\n- n: Need cost.\n- General.\n\n"
+        "Want the evidence behind these assumptions?"
+    )
+
+
+def test_submit_rejects_empty_assumptions():
+    with tempfile.TemporaryDirectory() as tmp:
+        backend = _make_backend(tmp)
+        try:
+            ctx = _flowed_ctx(backend, tmp)
+            for bad in ([], ["   "]):
+                result = json.loads(
+                    dispatch(
+                        ctx,
+                        "submit_answer",
+                        {"answer": "Total is 498440.43.", "assumptions": bad, "gaps": []},
+                    )
+                )
+                assert "order-status" in result["error"]
+            assert ctx.record.submission is None
+        finally:
+            backend.close()
+
+
 def test_gap_named_item_passes_without_proof():
     with tempfile.TemporaryDirectory() as tmp:
         backend = _make_backend(tmp)
@@ -306,7 +401,7 @@ def test_gap_named_item_passes_without_proof():
                     "submit_answer",
                     {
                         "answer": "Total is 498440.43.",
-                        "assumptions": [],
+                        "assumptions": ["All rows counted."],
                         "gaps": [{"item_id": "top_region", "note": "Need cost data."}],
                     },
                 )
@@ -378,11 +473,22 @@ def test_loop_shows_accepted_submit_text():
                     "gaps": []})),
                 _response(_message("WRONG TEXT")),
             ]
+            history: list = []
             result = answer_question(
-                _StubClient(script), "m", "instr", backend, [], "How many?",
+                _StubClient(script), "m", "instr", backend, history, "How many?",
                 runs_dir=Path(tmp) / "runs",
             )
-            assert result.text == "There are 3 items."
+            expected = (
+                "There are 3 items.\n\nAssumptions:\n- All rows counted.\n\n"
+                "Gaps:\n- none found\n\n"
+                "Want the evidence behind these assumptions?"
+            )
+            assert result.text == expected
+            assert any(
+                m.get("content", "") == expected
+                for m in history
+                if m.get("role") == "assistant"
+            )
             assert result.verification == "verification: 1 numbers matched, 0 unmatched"
             assert result.record_path is not None
         finally:
@@ -404,7 +510,9 @@ def test_loop_reminds_when_plain_text_without_submit():
                 _response(_call("c4", "record_finding", {
                     "item_id": "n", "claim": "3 items", "query_id": "q1", "value": 3})),
                 _response(_call("c5", "submit_answer", {
-                    "answer": "There are 3 items.", "assumptions": [], "gaps": []})),
+                    "answer": "There are 3 items.",
+                    "assumptions": ["All rows counted."],
+                    "gaps": []})),
                 _response(_message("done")),
             ]
             history: list = []
@@ -412,12 +520,22 @@ def test_loop_reminds_when_plain_text_without_submit():
                 _StubClient(script), "m", "instr", backend, history, "How many?",
                 runs_dir=Path(tmp) / "runs",
             )
-            assert result.text == "There are 3 items."
-            assert any(
-                m.get("content", "").startswith("You replied in plain text")
-                for m in history
-                if m.get("role") == "user"
+            expected = (
+                "There are 3 items.\n\nAssumptions:\n- All rows counted.\n\n"
+                "Gaps:\n- none found\n\n"
+                "Want the evidence behind these assumptions?"
             )
+            assert result.text == expected
+            # The reminder did its job (submit was accepted), then the turn's
+            # tool traffic — including the reminder — was compacted away.
+            assert all(
+                m.get("type") not in ("function_call", "function_call_output")
+                for m in history
+            )
+            assert len(history) == 3
+            assert history[0] == {"role": "user", "content": "How many?"}
+            assert "Work summary" in history[1].get("content", "")
+            assert history[2].get("content", "") == expected
         finally:
             backend.close()
 
@@ -470,7 +588,11 @@ def test_acceptance_on_final_round_returns_answer_not_cap():
                 client, "m", "instr", backend, [], "How many?",
                 runs_dir=Path(tmp) / "runs",
             )
-            assert result.text == "There are 3 items."
+            assert result.text == (
+                "There are 3 items.\n\nAssumptions:\n- All rows counted.\n\n"
+                "Gaps:\n- none found\n\n"
+                "Want the evidence behind these assumptions?"
+            )
             assert "Reached the" not in result.text
             assert client.calls == 16
             assert result.verification == "verification: 1 numbers matched, 0 unmatched"
@@ -496,8 +618,84 @@ def test_no_calls_after_early_acceptance():
                 client, "m", "instr", backend, [], "How many?",
                 runs_dir=Path(tmp) / "runs",
             )
-            assert result.text == "There are 3 items."
+            assert result.text == (
+                "There are 3 items.\n\nAssumptions:\n- All rows counted.\n\n"
+                "Gaps:\n- none found\n\n"
+                "Want the evidence behind these assumptions?"
+            )
             assert client.calls == 6
+        finally:
+            backend.close()
+
+
+def _accepted_answer_script(prefix: str):
+    return [
+        _response(_call(prefix + "1", "set_checklist", {"items": [
+            {"id": "n", "question": "How many?", "evidence_needed": "count"}]})),
+        _response(_call(prefix + "2", "update_plan", {"plan": [
+            {"item_id": "n", "steps": ["count"]}]})),
+        _response(_call(prefix + "3", "run_sql", {"query": "SELECT count(*) FROM items;"})),
+        _response(_call(prefix + "4", "record_finding", {
+            "item_id": "n", "claim": "3 items", "query_id": "q1", "value": 3})),
+        _response(_call(prefix + "5", "submit_answer", {
+            "answer": "There are 3 items.",
+            "assumptions": ["All rows counted."],
+            "gaps": []})),
+    ]
+
+
+def test_history_compacted_after_answer():
+    with tempfile.TemporaryDirectory() as tmp:
+        backend = _stub_backend(tmp)
+        try:
+            history: list = []
+            result = answer_question(
+                _StubClient(_accepted_answer_script("c")), "m", "instr",
+                backend, history, "How many?",
+                runs_dir=Path(tmp) / "runs",
+            )
+            assert all(
+                m.get("type") not in ("function_call", "function_call_output")
+                for m in history
+            )
+            assert len(history) == 3
+            assert history[0] == {"role": "user", "content": "How many?"}
+            summary = history[1].get("content", "")
+            assert "q1" in summary
+            assert "SELECT count(*) FROM items;" in summary
+            assert "3 items" in summary
+            assert history[2].get("content", "") == result.text
+            assert "Assumptions:" in result.text
+        finally:
+            backend.close()
+
+
+def test_history_stays_small_across_questions():
+    with tempfile.TemporaryDirectory() as tmp:
+        backend = _stub_backend(tmp)
+        try:
+            script = (
+                _accepted_answer_script("a")
+                + _accepted_answer_script("b")
+                + _accepted_answer_script("c")
+            )
+            client = _StubClient(script)
+            history: list = []
+            for question in ("First?", "Second?", "Third?"):
+                answer_question(
+                    client, "m", "instr", backend, history, question,
+                    runs_dir=Path(tmp) / "runs",
+                )
+            assert len(history) == 9
+            assert all(
+                m.get("type") not in ("function_call", "function_call_output")
+                for m in history
+            )
+            assert [m.get("content") for m in history if m.get("role") == "user"] == [
+                "First?",
+                "Second?",
+                "Third?",
+            ]
         finally:
             backend.close()
 
