@@ -24,7 +24,7 @@ Gaps:
 - If the data cannot answer the question, say so plainly. Only say this after you have checked list_tables and get_schema for relevant tables.
 - Then say what data you would need (for example "a cost column to compute profit"). Never estimate or invent it.
 - Offer the nearest question the data can answer.
-- If the question is open-ended, state the interpretation you chose, or ask which one the user means.
+- If the question is open-ended, call ask_clarification with the possible interpretations as options. Never choose an interpretation yourself.
 - Before submitting, compare each checklist item's evidence_needed with what you actually found. Report as gaps any limits on the answer, for example excluded order statuses, filtered date ranges, rows dropped by a join, or truncated results. Submit no gaps only if you checked and there are none.
 
 Last-used definitions:
