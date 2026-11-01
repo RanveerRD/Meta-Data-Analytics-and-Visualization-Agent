@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import TYPE_CHECKING, Any
 
 from agent.numbers import verify_text
@@ -19,7 +20,9 @@ SCHEMA: dict[str, Any] = {
     "description": (
         "Submit the final answer. Rejected unless every checklist item is "
         "proven or named in gaps, and every number in the answer appears in "
-        "a recorded query result or the user's question. A rejection lists "
+        "a recorded query result or the user's question. Answered "
+        "clarifications are added as user_chosen decisions automatically; "
+        "do not resubmit them. A rejection lists "
         "the unmatched numbers so the answer can be fixed and resubmitted. "
         "After 3 rejections the answer is accepted but marked escalated."
     ),
@@ -92,6 +95,59 @@ SCHEMA: dict[str, Any] = {
 _MISSING_RECORD_ERROR = "submit_answer is refused: call set_checklist first."
 _MAX_REJECTIONS = 3
 
+_WORD_RE = re.compile(r"[a-z0-9]+")
+
+
+def _auto_decisions(record) -> list[dict[str, Any]]:
+    """Build user_chosen decisions from answered clarifications, in code.
+
+    The model must not need to supply these; a model-supplied duplicate
+    (same proof id) is dropped by the caller.
+    """
+    auto: list[dict[str, Any]] = []
+    for clarification in record.clarifications:
+        if clarification.get("question") is None:
+            continue
+        key = clarification.get("definition_key")
+        question = clarification.get("question") or ""
+        what = f"{key}: {question}" if key else question
+        auto.append(
+            {
+                "what": what,
+                "choice": clarification.get("reply", ""),
+                "source": "user_chosen",
+                "proof": clarification["id"],
+            }
+        )
+    return auto
+
+
+def _topic_tokens(text: str) -> set[str]:
+    return {token for token in _WORD_RE.findall(text.lower()) if len(token) >= 4}
+
+
+def _covering_clarification(record, what: str, choice: str) -> str | None:
+    """Id of the first answered clarification sharing topic words, if any."""
+    topic = _topic_tokens(f"{what} {choice}")
+    if not topic:
+        return None
+    for clarification in record.clarifications:
+        if clarification.get("question") is None:
+            continue
+        haystack = _topic_tokens(
+            " ".join(
+                [
+                    clarification.get("question") or "",
+                    clarification.get("definition_key") or "",
+                    clarification.get("reply") or "",
+                    *(o.get("label", "") for o in clarification.get("options", [])),
+                ]
+            )
+        )
+        if topic & haystack:
+            return clarification["id"]
+    return None
+
 _SOURCES = ("user_stated", "user_chosen", "only_option")
 
 
@@ -149,10 +205,18 @@ def _validate_decisions(
                 "or only_option, or ask via ask_clarification"
             )
         elif source == "user_stated":
-            if len(proof.strip()) < 4 or proof.strip().lower() not in record.question.lower():
+            quote = proof.strip()
+            if len(quote) < 4 or quote.lower() not in record.question.lower():
                 problem = (
                     "user_stated proof must be a quote of at least 4 characters "
                     "from the user's question"
+                )
+            elif (
+                quote.lower() == record.question.strip().lower()
+                and len(record.question.split()) > 6
+            ):
+                problem = (
+                    "user_stated proof must be the stating words, not the whole question"
                 )
         elif source == "user_chosen":
             clarification = known_clarifications.get(proof.strip())
@@ -171,6 +235,13 @@ def _validate_decisions(
                     )
         elif proof.strip() not in known_queries:
             problem = f"unknown query {proof.strip()!r}"
+        else:
+            covering = _covering_clarification(record, what.strip(), choice.strip())
+            if covering is not None:
+                problem = (
+                    f"covered by clarification {covering}; cite it as user_chosen "
+                    "instead of only_option"
+                )
         normalized.append(
             {
                 "what": what.strip(),
@@ -216,9 +287,26 @@ def run(ctx: ToolContext, args: dict[str, Any]) -> str:
     answer = args.get("answer")
     if not isinstance(answer, str) or not answer.strip():
         return json.dumps({"error": "submit_answer needs a non-empty answer"})
-    decisions, failed, error = _validate_decisions(args.get("decisions", []), record)
+    auto = _auto_decisions(record)
+    raw = args.get("decisions", [])
+    if isinstance(raw, list):
+        auto_ids = {d["proof"] for d in auto}
+        raw = [
+            d
+            for d in raw
+            if not (
+                isinstance(d, dict)
+                and d.get("source") == "user_chosen"
+                and d.get("proof") in auto_ids
+            )
+        ]
+    decisions, failed, error = _validate_decisions(raw, record)
+    combined = auto + (decisions or [])
     if error is not None:
-        return _reject(record, error, [], answer, decisions, [], failed)
+        return _reject(
+            record, error, [], answer, combined, [],
+            [i + len(auto) for i in failed],
+        )
     gaps = _validate_gaps(args.get("gaps", []), record.item_ids())
     if isinstance(gaps, str):
         return json.dumps({"error": gaps})
@@ -230,13 +318,13 @@ def run(ctx: ToolContext, args: dict[str, Any]) -> str:
     ]
     if uncovered:
         reason = f"uncovered checklist items: {uncovered}"
-        return _reject(record, reason, [], answer, decisions, gaps)
+        return _reject(record, reason, [], answer, combined, gaps)
     cells = [v for q in record.queries for row in q["rows"] for v in row]
     matched, unmatched = verify_text(answer, record.question, cells)
     if unmatched:
         reason = f"unmatched numbers: {unmatched}"
-        return _reject(record, reason, unmatched, answer, decisions, gaps)
-    result = record.submit(answer, decisions, gaps, matched, unmatched)
+        return _reject(record, reason, unmatched, answer, combined, gaps)
+    result = record.submit(answer, combined, gaps, matched, unmatched)
     return json.dumps(result)
 
 

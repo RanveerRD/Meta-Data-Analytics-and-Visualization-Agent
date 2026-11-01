@@ -19,7 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from agent.backend import SqliteBackend  # noqa: E402
-from agent.loop import answer_question, render_answer  # noqa: E402
+from agent.loop import WRAP_UP_NUDGE, answer_question, render_answer  # noqa: E402
 from agent.numbers import extract_numbers, verify_text  # noqa: E402
 from agent.tools import TOOL_SCHEMAS, ToolContext, dispatch  # noqa: E402
 
@@ -415,7 +415,7 @@ CLARIFY_OPTIONS = [
 
 def _decided_ctx(backend: SqliteBackend, tmp: str) -> ToolContext:
     """Flowed context with findings plus one clarification (c1)."""
-    ctx = _ctx(backend, tmp, question="Revenue for delivered orders by region?")
+    ctx = _ctx(backend, tmp, question="Revenue for delivered orders by region today?")
     dispatch(ctx, "set_checklist", {"items": ITEMS})
     dispatch(ctx, "plan_action", {"plan": PLAN})
     result = json.loads(
@@ -456,11 +456,84 @@ def test_decisions_each_source_accepted():
                  "source": "user_stated", "proof": "delivered orders"},
                 {"what": "status scope", "choice": "delivered",
                  "source": "user_chosen", "proof": "c1"},
-                {"what": "metric", "choice": "revenue",
+                {"what": "date range", "choice": "all years",
                  "source": "only_option", "proof": "q1"},
             ])
             assert result["ok"] is True
             assert result["status"] == "answered"
+            stored = ctx.record.submission["decisions"]
+            assert [d["proof"] for d in stored] == ["c1", "delivered orders", "q1"]
+            assert stored[0]["source"] == "user_chosen"
+            assert stored[0]["choice"] == "delivered only"
+        finally:
+            backend.close()
+
+
+def test_only_option_accepted_without_clarification():
+    with tempfile.TemporaryDirectory() as tmp:
+        backend = _make_backend(tmp)
+        try:
+            ctx = _flowed_ctx(backend, tmp)
+            for item_id, value in (("total_revenue", 498440.43), ("top_region", "RJ")):
+                dispatch(
+                    ctx,
+                    "record_finding",
+                    {"item_id": item_id, "claim": "c", "query_id": "q1", "value": value},
+                )
+            result = _submit(ctx, [
+                {"what": "metric", "choice": "revenue",
+                 "source": "only_option", "proof": "q1"},
+            ])
+            assert result["ok"] is True
+        finally:
+            backend.close()
+
+
+def test_only_option_refused_when_clarified():
+    with tempfile.TemporaryDirectory() as tmp:
+        backend = _make_backend(tmp)
+        try:
+            ctx = _decided_ctx(backend, tmp)
+            result = _submit(ctx, [
+                {"what": "status scope", "choice": "delivered orders",
+                 "source": "user_stated", "proof": "delivered orders"},
+                {"what": "metric", "choice": "revenue",
+                 "source": "only_option", "proof": "q1"},
+            ])
+            assert "covered by clarification c1" in result["error"]
+            assert "user_chosen" in result["error"]
+            assert ctx.record.submission is None
+        finally:
+            backend.close()
+
+
+def test_user_stated_whole_question_refused():
+    with tempfile.TemporaryDirectory() as tmp:
+        backend = _make_backend(tmp)
+        try:
+            ctx = _decided_ctx(backend, tmp)
+            whole = "Revenue for delivered orders by region today?"
+            result = _submit(ctx, [
+                {"what": "scope", "choice": "everything",
+                 "source": "user_stated", "proof": whole},
+            ])
+            assert "whole question" in result["error"]
+            short = _ctx(backend, tmp, question="Total sales?")
+            dispatch(short, "set_checklist", {"items": ITEMS})
+            dispatch(short, "plan_action", {"plan": PLAN})
+            dispatch(short, "run_sql", {"query": "SELECT 1;"})
+            ok = json.loads(
+                dispatch(short, "submit_answer", {
+                    "answer": "Total is 1.",
+                    "decisions": [
+                        {"what": "scope", "choice": "everything",
+                         "source": "user_stated", "proof": "Total sales?"},
+                    ],
+                    "gaps": [{"item_id": "total_revenue", "note": "x"},
+                             {"item_id": "top_region", "note": "y"}],
+                })
+            )
+            assert ok["ok"] is True
         finally:
             backend.close()
 
@@ -473,8 +546,6 @@ def test_decision_proof_failures_rejected():
          "at least 4 characters"),
         ([{"what": "s", "choice": "x", "source": "user_chosen", "proof": "c99"}],
          "unknown clarification"),
-        ([{"what": "s", "choice": "canceled", "source": "user_chosen", "proof": "c1"}],
-         "does not match"),
         ([{"what": "s", "choice": "x", "source": "only_option", "proof": "q99"}],
          "unknown query"),
         ([{"what": "s", "choice": "x", "source": "vibes", "proof": "q1"}],
@@ -492,6 +563,40 @@ def test_decision_proof_failures_rejected():
             backend.close()
 
 
+def test_user_chosen_matches_user_question_reply():
+    with tempfile.TemporaryDirectory() as tmp:
+        backend = _make_backend(tmp)
+        try:
+            ctx = _flowed_ctx(backend, tmp)
+            for item_id, value in (("total_revenue", 498440.43), ("top_region", "RJ")):
+                dispatch(
+                    ctx,
+                    "record_finding",
+                    {"item_id": item_id, "claim": "c", "query_id": "q1", "value": value},
+                )
+            ctx.ask_user = lambda q, opts: {"user_question": "should canceled orders count?"}
+            asked = json.loads(
+                dispatch(ctx, "ask_clarification", {
+                    "question": "Which statuses count?",
+                    "options": CLARIFY_OPTIONS,
+                })
+            )
+            assert asked["user_question"] == "should canceled orders count?"
+            bad = _submit(ctx, [
+                {"what": "status scope", "choice": "delivered",
+                 "source": "user_chosen", "proof": "c1"},
+            ])
+            assert "does not match" in bad["error"]
+            good = _submit(ctx, [
+                {"what": "status scope", "choice": "canceled orders",
+                 "source": "user_chosen", "proof": "c1"},
+            ])
+            assert good["ok"] is True
+            assert good["rejections"] == 1
+        finally:
+            backend.close()
+
+
 def test_escalation_marks_unconfirmed_decisions():
     with tempfile.TemporaryDirectory() as tmp:
         backend = _make_backend(tmp)
@@ -500,7 +605,7 @@ def test_escalation_marks_unconfirmed_decisions():
             bad = [
                 {"what": "status scope", "choice": "x",
                  "source": "user_stated", "proof": "xyz"},
-                {"what": "metric", "choice": "revenue",
+                {"what": "date range", "choice": "all years",
                  "source": "only_option", "proof": "q1"},
             ]
             last = {}
@@ -509,9 +614,10 @@ def test_escalation_marks_unconfirmed_decisions():
             assert last["status"] == "escalated"
             assert "UNCONFIRMED DECISIONS: ['status scope']" in last["warning"]
             stored = ctx.record.submission["decisions"]
-            assert stored[0].get("unconfirmed") is True
-            assert "unconfirmed" not in stored[1]
-            assert ctx.record.submission["decisions"] == stored
+            assert stored[0]["proof"] == "c1"
+            assert "unconfirmed" not in stored[0]
+            assert stored[1].get("unconfirmed") is True
+            assert "unconfirmed" not in stored[2]
         finally:
             backend.close()
 
@@ -850,6 +956,78 @@ def test_history_stays_small_across_questions():
             backend.close()
 
 
+def test_clarification_rounds_do_not_use_cap(monkeypatch):
+    monkeypatch.setattr("agent.loop.MAX_TURNS", 5)
+    with tempfile.TemporaryDirectory() as tmp:
+        backend = _stub_backend(tmp)
+        try:
+            ask = {
+                "question": "Which rows count?",
+                "options": [
+                    {"label": "all counted rows", "query_id": "q1", "evidence": 3,
+                     "explanation": "counts every row"},
+                    {"label": "only these rows", "query_id": "q1", "evidence": 3,
+                     "explanation": "counts these rows"},
+                ],
+                "definition_key": "row_scope",
+            }
+            script = [
+                _response(_call("c1", "set_checklist", {"items": [
+                    {"id": "n", "question": "How many?", "evidence_needed": "count"}]})),
+                _response(_call("c2", "plan_action", {"plan": [
+                    {"item_id": "n", "steps": ["count"]}]})),
+                _response(_call("c3", "run_sql", {"query": "SELECT count(*) FROM items;"})),
+                _response(_call("c4", "ask_clarification", dict(ask))),
+                _response(_call("c5", "ask_clarification", dict(ask))),
+                _response(_call("c6", "record_finding", {
+                    "item_id": "n", "claim": "3 items", "query_id": "q1", "value": 3})),
+                _response(_call("c7", "submit_answer", {
+                    "answer": "There are 3 items.",
+                    "decisions": [
+                        {"what": "scope", "choice": "everything",
+                         "source": "user_stated", "proof": "How many?"},
+                    ],
+                    "gaps": []})),
+            ]
+            client = _StubClient(script)
+            result = answer_question(
+                client, "m", "instr", backend, [], "How many?",
+                runs_dir=Path(tmp) / "runs",
+                ask_user=lambda q, opts: {"choice": opts[0]["label"]},
+            )
+            assert "Reached the" not in result.text
+            assert "There are 3 items." in result.text
+            assert client.calls == 7
+        finally:
+            backend.close()
+
+
+def test_wrap_up_nudge_sent_with_three_rounds_left(monkeypatch):
+    monkeypatch.setattr("agent.loop.MAX_TURNS", 6)
+    with tempfile.TemporaryDirectory() as tmp:
+        backend = _stub_backend(tmp)
+        try:
+            script = [
+                _response(_call("c1", "set_checklist", {"items": [
+                    {"id": "n", "question": "How many?", "evidence_needed": "count"}]})),
+                _response(_call("c2", "plan_action", {"plan": [
+                    {"item_id": "n", "steps": ["count"]}]})),
+                _response(_call("c3", "run_sql", {"query": "SELECT count(*) FROM items;"})),
+            ]
+            history: list = []
+            result = answer_question(
+                _StubClient(script), "m", "instr", backend, history, "How many?",
+                runs_dir=Path(tmp) / "runs",
+            )
+            assert result.record_path is not None
+            assert any(
+                m.get("role") == "user" and m.get("content") == WRAP_UP_NUDGE
+                for m in history
+            )
+        finally:
+            backend.close()
+
+
 def test_cap_shows_partial_summary():
     with tempfile.TemporaryDirectory() as tmp:
         backend = _stub_backend(tmp)
@@ -872,10 +1050,10 @@ def test_cap_shows_partial_summary():
                 _StubClient(script), "m", "instr", backend, [], "How many?",
                 runs_dir=Path(tmp) / "runs",
             )
-            assert "Reached the 16-turn limit" in result.text
+            assert "Reached the 20-turn limit" in result.text
             assert "- n: proven" in result.text
             assert "- 3 items (3)" in result.text
-            assert "Queries run: 13" in result.text
+            assert "Queries run: 17" in result.text
             assert "Record: " in result.text
             assert result.verification == "verification: no submitted answer"
         finally:

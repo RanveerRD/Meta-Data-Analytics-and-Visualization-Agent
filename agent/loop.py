@@ -19,13 +19,17 @@ from agent.tools import TOOL_SCHEMAS, ToolContext, dispatch
 
 MODEL_DEFAULT = "muse-spark-1.3-contributor"
 BASE_URL = "https://api.meta.ai/v1"
-MAX_TURNS = 16
+MAX_TURNS = 20
 REMINDER_TURNS = 3
-CAP_MESSAGE = "Reached the 16-turn limit without a final answer."
+CAP_MESSAGE = "Reached the 20-turn limit without a final answer."
 SUBMIT_REMINDER = (
     "You replied in plain text without submitting. Record a finding for "
     "each key number with record_finding, then call submit_answer. "
     "Do not answer in plain text."
+)
+WRAP_UP_NUDGE = (
+    "Only 3 rounds remain. Stop running new queries and call submit_answer "
+    "now using the findings already recorded."
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -313,7 +317,11 @@ def answer_question(
     runs_dir: Path = RUNS_DIR,
     ask_user: Any = None,
 ) -> TurnResult:
-    """Ask one question, keeping shared history. At most MAX_TURNS model calls."""
+    """Ask one question, keeping shared history.
+
+    At most MAX_TURNS counting rounds; rounds that pause for a user
+    clarification do not count because they are waiting for the human.
+    """
     ctx = ToolContext(
         backend=backend, question=question, runs_dir=runs_dir, ask_user=ask_user
     )
@@ -323,7 +331,18 @@ def answer_question(
     last_text = ""
     capped = False
     api_failed = False
-    for _ in range(MAX_TURNS):
+    budget = 0
+    nudged = False
+    while True:
+        if budget >= MAX_TURNS:
+            capped = True
+            break
+        if budget == MAX_TURNS - 3 and not nudged:
+            history.append({"role": "user", "content": WRAP_UP_NUDGE})
+            nudged = True
+        calls_before = (
+            ctx.record.clarification_calls if ctx.record is not None else 0
+        )
         last_text, had_calls, api_error = _round(
             client, model, instructions, ctx, history, usage
         )
@@ -333,10 +352,13 @@ def answer_question(
             break
         if ctx.record is not None and ctx.record.submission is not None:
             break
+        calls_after = (
+            ctx.record.clarification_calls if ctx.record is not None else 0
+        )
+        if calls_after == calls_before:
+            budget += 1
         if not had_calls:
             break
-    else:
-        capped = True
     submission = ctx.record.submission if ctx.record is not None else None
     if (
         not capped

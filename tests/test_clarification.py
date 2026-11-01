@@ -468,6 +468,7 @@ def test_instructions_require_asking_every_time():
     assert "do not ask when an approved definition exists" not in text
     assert "EVERY time, even if a saved definition exists" in text
     assert "top_metric" in text
+    assert "after the last clarification is answered" in text.lower()
 
 
 def test_loop_continues_same_turn_after_reply():
