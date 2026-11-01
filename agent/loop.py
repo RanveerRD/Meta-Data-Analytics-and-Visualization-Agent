@@ -155,12 +155,16 @@ def _render_decision(
     if source == "user_chosen":
         for clarification in clarifications:
             if clarification["id"] == decision["proof"]:
+                key = (clarification.get("definition_key") or "").replace("_", " ")
+                label = clarification.get("reply", "")
                 for j, option in enumerate(clarification.get("options", []), 1):
                     if option.get("label") == clarification.get("reply"):
-                        return f"{base} (you chose: option {j})"
-                return f"{base} (you chose: \"{clarification.get('reply')}\")"
+                        if key:
+                            return f"- {key}: {label} (you chose: option {j})"
+                        return f"- {label} (you chose: option {j})"
+                return f"{base} (you chose: \"{label}\")"
         return f"{base} (you chose: \"{decision['proof']}\")"
-    return f"{base} (only option in the data)"
+    return f"{base} (not asked: no alternative found, query {decision['proof']})"
 
 
 def render_answer(

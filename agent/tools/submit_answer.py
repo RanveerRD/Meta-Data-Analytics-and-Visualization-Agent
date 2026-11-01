@@ -307,8 +307,11 @@ def run(ctx: ToolContext, args: dict[str, Any]) -> str:
                 and d.get("proof") in auto_ids
             )
         ]
-    decisions, failed, error = _validate_decisions(raw, record)
-    combined = auto + (decisions or [])
+    if isinstance(raw, list) and not raw and auto:
+        combined, failed, error = auto, [], None
+    else:
+        decisions, failed, error = _validate_decisions(raw, record)
+        combined = auto + (decisions or [])
     if error is not None:
         return _reject(
             record, error, [], answer, combined, [],

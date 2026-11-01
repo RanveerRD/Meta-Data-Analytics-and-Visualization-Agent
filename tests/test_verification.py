@@ -359,7 +359,7 @@ def test_render_answer_without_gaps():
     }
     assert render_answer(submission, []) == (
         "A.\n\nDecisions:\n- scope: all (you stated: \"all rows\")\n"
-        "- metric: revenue (only option in the data)\n\nGaps:\n- none found\n\n"
+        "- metric: revenue (not asked: no alternative found, query q1)\n\nGaps:\n- none found\n\n"
         "Want the evidence behind these decisions?"
     )
 
@@ -379,6 +379,7 @@ def test_render_answer_with_gaps():
     clarifications = [
         {
             "id": "c1",
+            "definition_key": "revenue",
             "options": [
                 {"label": "delivered only"},
                 {"label": "all statuses"},
@@ -387,7 +388,7 @@ def test_render_answer_with_gaps():
         }
     ]
     assert render_answer(submission, clarifications) == (
-        "A.\n\nDecisions:\n- metric: delivered only (you chose: option 1)\n"
+        "A.\n\nDecisions:\n- revenue: delivered only (you chose: option 1)\n"
         "- bad: x (UNCONFIRMED)\n\nGaps:\n- n: Need cost.\n- General.\n\n"
         "Want the evidence behind these decisions?"
     )
@@ -702,6 +703,44 @@ def test_escalation_marks_unconfirmed_decisions():
             backend.close()
 
 
+def test_user_chosen_renders_key_with_spaces():
+    submission = {
+        "answer": "A.",
+        "decisions": [
+            {"what": "m", "choice": "sold", "source": "user_chosen", "proof": "c1"},
+        ],
+        "gaps": [],
+    }
+    clarifications = [
+        {
+            "id": "c1",
+            "definition_key": "top_metric",
+            "options": [{"label": "revenue"}, {"label": "items sold"}],
+            "reply": "items sold",
+        }
+    ]
+    assert render_answer(submission, clarifications) == (
+        "A.\n\nDecisions:\n- top metric: items sold (you chose: option 2)\n\n"
+        "Gaps:\n- none found\n\nWant the evidence behind these decisions?"
+    )
+
+
+def test_empty_decisions_accepted_with_clarifications():
+    with tempfile.TemporaryDirectory() as tmp:
+        backend = _make_backend(tmp)
+        try:
+            ctx = _decided_ctx(backend, tmp)
+            result = _submit(ctx, [])
+            assert result["ok"] is True
+            stored = ctx.record.submission["decisions"]
+            assert len(stored) == 1
+            assert stored[0]["source"] == "user_chosen"
+            assert stored[0]["proof"] == "c1"
+            assert stored[0]["choice"] == "delivered only"
+        finally:
+            backend.close()
+
+
 def test_submit_rejects_empty_decisions():
     with tempfile.TemporaryDirectory() as tmp:
         backend = _make_backend(tmp)
@@ -815,7 +854,7 @@ def test_loop_shows_accepted_submit_text():
                 runs_dir=Path(tmp) / "runs",
             )
             expected = (
-                "There are 3 items.\n\nDecisions:\n- scope: all rows (only option in the data)\n\n"
+                "There are 3 items.\n\nDecisions:\n- scope: all rows (not asked: no alternative found, query q1)\n\n"
                 "Gaps:\n- none found\n\n"
                 "Want the evidence behind these decisions?"
             )
@@ -857,7 +896,7 @@ def test_loop_reminds_when_plain_text_without_submit():
                 runs_dir=Path(tmp) / "runs",
             )
             expected = (
-                "There are 3 items.\n\nDecisions:\n- scope: all rows (only option in the data)\n\n"
+                "There are 3 items.\n\nDecisions:\n- scope: all rows (not asked: no alternative found, query q1)\n\n"
                 "Gaps:\n- none found\n\n"
                 "Want the evidence behind these decisions?"
             )
@@ -925,7 +964,7 @@ def test_acceptance_on_final_round_returns_answer_not_cap():
                 runs_dir=Path(tmp) / "runs",
             )
             assert result.text == (
-                "There are 3 items.\n\nDecisions:\n- scope: all rows (only option in the data)\n\n"
+                "There are 3 items.\n\nDecisions:\n- scope: all rows (not asked: no alternative found, query q1)\n\n"
                 "Gaps:\n- none found\n\n"
                 "Want the evidence behind these decisions?"
             )
@@ -955,7 +994,7 @@ def test_no_calls_after_early_acceptance():
                 runs_dir=Path(tmp) / "runs",
             )
             assert result.text == (
-                "There are 3 items.\n\nDecisions:\n- scope: all rows (only option in the data)\n\n"
+                "There are 3 items.\n\nDecisions:\n- scope: all rows (not asked: no alternative found, query q1)\n\n"
                 "Gaps:\n- none found\n\n"
                 "Want the evidence behind these decisions?"
             )
