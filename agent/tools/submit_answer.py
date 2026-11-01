@@ -97,6 +97,8 @@ _MAX_REJECTIONS = 3
 
 _WORD_RE = re.compile(r"[a-z0-9]+")
 
+_IGNORED_KEY_TOKENS = frozenset({"only", "the", "and", "for"})
+
 
 def _auto_decisions(record) -> list[dict[str, Any]]:
     """Build user_chosen decisions from answered clarifications, in code.
@@ -122,29 +124,34 @@ def _auto_decisions(record) -> list[dict[str, Any]]:
     return auto
 
 
-def _topic_tokens(text: str) -> set[str]:
-    return {token for token in _WORD_RE.findall(text.lower()) if len(token) >= 4}
+def _key_tokens(text: str) -> set[str]:
+    return {
+        token
+        for token in _WORD_RE.findall(text.lower())
+        if len(token) >= 3 and token not in _IGNORED_KEY_TOKENS
+    }
 
 
-def _covering_clarification(record, what: str, choice: str) -> str | None:
-    """Id of the first answered clarification sharing topic words, if any."""
-    topic = _topic_tokens(f"{what} {choice}")
+def _covering_clarification(record, what: str) -> str | None:
+    """Id of the first keyed clarification overlapping the what text, if any.
+
+    Only the clarification's definition_key (split on "_") is compared
+    against the decision's what text. Clarifications without a key are
+    skipped, as are choice, question, options and reply.
+    """
+    topic = _key_tokens(what)
     if not topic:
         return None
     for clarification in record.clarifications:
-        if clarification.get("question") is None:
+        key = clarification.get("definition_key") or ""
+        if not key.strip():
             continue
-        haystack = _topic_tokens(
-            " ".join(
-                [
-                    clarification.get("question") or "",
-                    clarification.get("definition_key") or "",
-                    clarification.get("reply") or "",
-                    *(o.get("label", "") for o in clarification.get("options", [])),
-                ]
-            )
-        )
-        if topic & haystack:
+        parts = {
+            part
+            for part in key.lower().split("_")
+            if len(part) >= 3 and part not in _IGNORED_KEY_TOKENS
+        }
+        if topic & parts:
             return clarification["id"]
     return None
 
@@ -236,7 +243,7 @@ def _validate_decisions(
         elif proof.strip() not in known_queries:
             problem = f"unknown query {proof.strip()!r}"
         else:
-            covering = _covering_clarification(record, what.strip(), choice.strip())
+            covering = _covering_clarification(record, what.strip())
             if covering is not None:
                 problem = (
                     f"covered by clarification {covering}; cite it as user_chosen "

@@ -497,12 +497,92 @@ def test_only_option_refused_when_clarified():
             result = _submit(ctx, [
                 {"what": "status scope", "choice": "delivered orders",
                  "source": "user_stated", "proof": "delivered orders"},
-                {"what": "metric", "choice": "revenue",
+                {"what": "revenue definition", "choice": "delivered only",
                  "source": "only_option", "proof": "q1"},
             ])
             assert "covered by clarification c1" in result["error"]
             assert "user_chosen" in result["error"]
             assert ctx.record.submission is None
+        finally:
+            backend.close()
+
+
+def _proven_ctx(backend: SqliteBackend, tmp: str) -> ToolContext:
+    """Flowed context with both items proven, ready to submit."""
+    ctx = _flowed_ctx(backend, tmp)
+    for item_id, value in (("total_revenue", 498440.43), ("top_region", "RJ")):
+        dispatch(
+            ctx,
+            "record_finding",
+            {"item_id": item_id, "claim": "c", "query_id": "q1", "value": value},
+        )
+    return ctx
+
+
+def test_only_option_matches_definition_key_only():
+    with tempfile.TemporaryDirectory() as tmp:
+        backend = _make_backend(tmp)
+        try:
+            ctx = _proven_ctx(backend, tmp)
+            ctx.record.store_clarification(
+                "Which orders should count toward the 2017 top category?",
+                [{"label": "delivered only", "query_id": "q1", "evidence": "SP"}],
+                "delivered only",
+                "order_status",
+            )
+            for what in (
+                "year date column",
+                "category names",
+                "only items with a matching product",
+            ):
+                result = _submit(ctx, [
+                    {"what": what, "choice": "order_purchase_timestamp",
+                     "source": "only_option", "proof": "q1"},
+                ])
+                assert result["ok"] is True, what
+            for key, what, choice in (
+                ("revenue", "revenue definition", "revenue"),
+                ("year_date", "year date column", "order_purchase_timestamp"),
+                ("top_metric", "top metric", "items sold"),
+            ):
+                fresh = _proven_ctx(backend, tmp)
+                fresh.record.store_clarification("Which?", [], choice, key)
+                refused = _submit(fresh, [
+                    {"what": what, "choice": choice,
+                     "source": "only_option", "proof": "q1"},
+                ])
+                assert "covered by clarification c1" in refused["error"], what
+        finally:
+            backend.close()
+
+
+def test_keyless_clarifications_never_block_only_option():
+    with tempfile.TemporaryDirectory() as tmp:
+        backend = _make_backend(tmp)
+        try:
+            ctx = _flowed_ctx(backend, tmp)
+            for item_id, value in (("total_revenue", 498440.43), ("top_region", "RJ")):
+                dispatch(
+                    ctx,
+                    "record_finding",
+                    {"item_id": item_id, "claim": "c", "query_id": "q1", "value": value},
+                )
+            ctx.ask_user = lambda q, opts: {"choice": opts[0]["label"]}
+            dispatch(ctx, "ask_clarification", {
+                "question": "Which statuses count?",
+                "options": CLARIFY_OPTIONS,
+            })
+            assert ctx.record.clarifications[0]["definition_key"] is None
+            ctx.ask_user = lambda q, opts: {"user_question": "what about canceled?"}
+            dispatch(ctx, "ask_clarification", {
+                "question": "Which statuses count?",
+                "options": CLARIFY_OPTIONS,
+            })
+            result = _submit(ctx, [
+                {"what": "delivered scope", "choice": "delivered",
+                 "source": "only_option", "proof": "q1"},
+            ])
+            assert result["ok"] is True
         finally:
             backend.close()
 
