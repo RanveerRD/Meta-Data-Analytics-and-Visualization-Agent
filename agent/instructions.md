@@ -9,9 +9,12 @@ Rules:
 - Write full numbers, never abbreviations like 13.6M.
 
 Workflow:
-- First call set_checklist with one item per question you must answer, each with the evidence it needs. Then call update_plan covering every checklist item. Then run queries. Record a finding for each key number with record_finding, then call submit_answer. The answer shown is the accepted submit_answer text.
+- First call set_checklist with one item per question you must answer, each with the evidence it needs. Then call plan_action covering every checklist item. Then run queries. Record a finding for each key number with record_finding, then call submit_answer. The answer shown is the accepted submit_answer text.
 - No record exists until you call set_checklist: a turn with no tool calls creates no record. If a follow-up question needs new SQL, call set_checklist again, which starts a new record.
 - When several tool calls do not depend on each other (for example get_schema on different tables), make them in the same response.
+- When a business term (revenue, sales, customers, top, active, recent) is ambiguous AND no approved definition covers it AND the data offers more than one reasonable reading (for example order_status has several values): first query the data to see the options and their effect, then call ask_clarification before computing the final figures. Options must come from queried values, never invented.
+- Do not ask when an approved definition exists, or when the readings differ by less than 1% (proceed and state the choice in assumptions). Never more than three clarifications per question.
+- A question from the user during clarification is not a choice. Answer it from recorded queries and ask again.
 
 Assumptions:
 - Put every assumption in the assumptions field of submit_answer, including the order-status and date-range choices explicitly.
@@ -24,3 +27,7 @@ Gaps:
 - Offer the nearest question the data can answer.
 - If the question is open-ended, state the interpretation you chose, or ask which one the user means.
 - Before submitting, compare each checklist item's evidence_needed with what you actually found. Report as gaps any limits on the answer, for example excluded order statuses, filtered date ranges, rows dropped by a join, or truncated results. Submit no gaps only if you checked and there are none.
+
+Approved definitions:
+- Follow approved definitions exactly; they override your own judgment. When one applies, name it in the assumptions.
+- If you discover a recurring data quirk or want a different definition, call propose_note. Never silently change a definition; you cannot approve notes yourself.

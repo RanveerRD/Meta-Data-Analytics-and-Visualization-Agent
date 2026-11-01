@@ -15,7 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from agent.record import AnalysisRecord  # noqa: E402
+from agent.record import MAX_FAILED_QUERIES, AnalysisRecord  # noqa: E402
 
 ITEMS = [
     {"id": "total_orders", "question": "How many orders?", "evidence_needed": "count of orders"},
@@ -68,18 +68,18 @@ def test_plan_must_cover_every_item():
         record = _record(tmp)
         record.set_checklist(ITEMS)
         try:
-            record.update_plan([{"item_id": "total_orders", "steps": ["count"]}])
+            record.plan_action([{"item_id": "total_orders", "steps": ["count"]}])
         except ValueError:
             pass
         else:
             raise AssertionError("expected ValueError for partial plan")
         try:
-            record.update_plan([{"item_id": "nope", "steps": ["x"]}])
+            record.plan_action([{"item_id": "nope", "steps": ["x"]}])
         except ValueError:
             pass
         else:
             raise AssertionError("expected ValueError for unknown item")
-        record.update_plan(PLAN)
+        record.plan_action(PLAN)
         assert [p["item_id"] for p in record.plan] == ["total_orders", "top_state"]
 
 
@@ -87,7 +87,7 @@ def test_queries_recorded_with_ids():
     with tempfile.TemporaryDirectory() as tmp:
         record = _record(tmp)
         record.set_checklist(ITEMS)
-        record.update_plan(PLAN)
+        record.plan_action(PLAN)
         q1 = record.record_query(
             "SELECT 1;", {"columns": ["x"], "row_count": 1, "truncated": False, "rows": [[1]]}
         )
@@ -110,12 +110,12 @@ def test_audit_only_grows():
         assert len(record.audit) > before
         seqs = [a["seq"] for a in record.audit]
         assert seqs == sorted(seqs)
-        record.update_plan(PLAN)
+        record.plan_action(PLAN)
         record.record_query("SELECT 1;", {"columns": [], "row_count": 0, "truncated": False, "rows": []})
         seqs = [a["seq"] for a in record.audit]
         assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs)
         actions = [a["action"] for a in record.audit]
-        assert actions == ["created", "set_checklist", "update_plan", "record_query"]
+        assert actions == ["created", "set_checklist", "plan_action", "record_query"]
 
 
 def test_state_changes_only_through_methods():
@@ -132,7 +132,7 @@ def test_atomic_save_and_load():
     with tempfile.TemporaryDirectory() as tmp:
         record = _record(tmp)
         record.set_checklist(ITEMS)
-        record.update_plan(PLAN)
+        record.plan_action(PLAN)
         path = record.path
         assert path.is_file()
         assert not any(p.suffix == ".tmp" for p in path.parent.iterdir())
@@ -142,6 +142,35 @@ def test_atomic_save_and_load():
         loaded = AnalysisRecord.load(path)
         assert loaded.run_id == record.run_id
         assert [c["id"] for c in loaded.checklist] == ["total_orders", "top_state"]
+
+
+def test_failed_queries_capped_at_fifty():
+    with tempfile.TemporaryDirectory() as tmp:
+        record = _record(tmp)
+        record.set_checklist(ITEMS)
+        record.plan_action(PLAN)
+        audit_before = len(record.audit)
+        for i in range(55):
+            fid = record.record_failed_query(f"SELECT {i};", "OperationalError: boom", "error")
+            assert fid == f"f{i + 1}"
+        failed = record.failed_queries
+        assert len(failed) == MAX_FAILED_QUERIES
+        assert failed[0]["id"] == "f6"
+        assert failed[-1]["id"] == "f55"
+        assert len(record.audit) == audit_before + 55
+        actions = [a["action"] for a in record.audit[-55:]]
+        assert set(actions) == {"record_failed_query"}
+        assert "timestamp" in failed[0]
+
+
+def test_record_finding_refuses_failed_query_id():
+    with tempfile.TemporaryDirectory() as tmp:
+        record = _record(tmp)
+        record.set_checklist(ITEMS)
+        record.plan_action(PLAN)
+        record.record_failed_query("SELECT bad;", "OperationalError: boom", "error")
+        refused = record.record_finding("total_orders", "c", "f1", 5)
+        assert "no citable result" in refused["error"]
 
 
 if __name__ == "__main__":

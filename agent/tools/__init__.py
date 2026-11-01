@@ -30,24 +30,30 @@ class ToolContext:
     question: str = ""
     runs_dir: Path = field(default_factory=lambda: Path("workspace") / "runs")
     record: AnalysisRecord | None = None
+    memory_dir: Path | None = None
+    ask_user: Any = None
 
 
 def _tool_modules() -> tuple:
     from agent.tools import (
+        ask_clarification,
         get_schema,
         list_tables,
+        plan_action,
+        propose_note,
         record_finding,
         run_sql,
         set_checklist,
         submit_answer,
-        update_plan,
     )
 
     return (
         list_tables,
         get_schema,
         set_checklist,
-        update_plan,
+        plan_action,
+        propose_note,
+        ask_clarification,
         record_finding,
         run_sql,
         submit_answer,

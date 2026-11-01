@@ -57,7 +57,7 @@ def _flowed_ctx(backend: SqliteBackend, tmp: str) -> ToolContext:
     """Context with checklist, plan, and one recorded query (q1)."""
     ctx = _ctx(backend, tmp)
     assert json.loads(dispatch(ctx, "set_checklist", {"items": ITEMS}))["ok"] is True
-    assert json.loads(dispatch(ctx, "update_plan", {"plan": PLAN}))["ok"] is True
+    assert json.loads(dispatch(ctx, "plan_action", {"plan": PLAN}))["ok"] is True
     result = json.loads(
         dispatch(ctx, "run_sql", {"query": "SELECT region, revenue FROM sales ORDER BY region;"})
     )
@@ -462,7 +462,7 @@ def test_loop_shows_accepted_submit_text():
             script = [
                 _response(_call("c1", "set_checklist", {"items": [
                     {"id": "n", "question": "How many?", "evidence_needed": "count"}]})),
-                _response(_call("c2", "update_plan", {"plan": [
+                _response(_call("c2", "plan_action", {"plan": [
                     {"item_id": "n", "steps": ["count"]}]})),
                 _response(_call("c3", "run_sql", {"query": "SELECT count(*) FROM items;"})),
                 _response(_call("c4", "record_finding", {
@@ -503,7 +503,7 @@ def test_loop_reminds_when_plain_text_without_submit():
                 _response(
                     _call("c1", "set_checklist", {"items": [
                         {"id": "n", "question": "How many?", "evidence_needed": "count"}]}),
-                    _call("c2", "update_plan", {"plan": [
+                    _call("c2", "plan_action", {"plan": [
                         {"item_id": "n", "steps": ["count"]}]})),
                 _response(_message("The answer is 3 items.")),
                 _response(_call("c3", "run_sql", {"query": "SELECT count(*) FROM items;"})),
@@ -566,7 +566,7 @@ def test_acceptance_on_final_round_returns_answer_not_cap():
                 _response(
                     _call("c1", "set_checklist", {"items": [
                         {"id": "n", "question": "How many?", "evidence_needed": "count"}]}),
-                    _call("c2", "update_plan", {"plan": [
+                    _call("c2", "plan_action", {"plan": [
                         {"item_id": "n", "steps": ["count"]}]})),
             ]
             for i in range(1, 14):
@@ -606,7 +606,7 @@ def test_no_calls_after_early_acceptance():
         try:
             script = [
                 _response(_call("c1", "set_checklist", {"items": [{"id": "n", "question": "How many?", "evidence_needed": "count"}]})),
-                _response(_call("c2", "update_plan", {"plan": [{"item_id": "n", "steps": ["count"]}]})),
+                _response(_call("c2", "plan_action", {"plan": [{"item_id": "n", "steps": ["count"]}]})),
                 _response(_call("c3", "get_schema", {"table": "items"})),
                 _response(_call("c4", "run_sql", {"query": "SELECT count(*) FROM items;"})),
                 _response(_call("c5", "record_finding", {"item_id": "n", "claim": "3 items", "query_id": "q1", "value": 3})),
@@ -632,7 +632,7 @@ def _accepted_answer_script(prefix: str):
     return [
         _response(_call(prefix + "1", "set_checklist", {"items": [
             {"id": "n", "question": "How many?", "evidence_needed": "count"}]})),
-        _response(_call(prefix + "2", "update_plan", {"plan": [
+        _response(_call(prefix + "2", "plan_action", {"plan": [
             {"item_id": "n", "steps": ["count"]}]})),
         _response(_call(prefix + "3", "run_sql", {"query": "SELECT count(*) FROM items;"})),
         _response(_call(prefix + "4", "record_finding", {
@@ -696,6 +696,38 @@ def test_history_stays_small_across_questions():
                 "Second?",
                 "Third?",
             ]
+        finally:
+            backend.close()
+
+
+def test_cap_shows_partial_summary():
+    with tempfile.TemporaryDirectory() as tmp:
+        backend = _stub_backend(tmp)
+        try:
+            script = [
+                _response(_call("c1", "set_checklist", {"items": [
+                    {"id": "n", "question": "How many?", "evidence_needed": "count"}]})),
+                _response(_call("c2", "plan_action", {"plan": [
+                    {"item_id": "n", "steps": ["count"]}]})),
+                _response(_call("c3", "run_sql", {"query": "SELECT count(*) FROM items;"})),
+                _response(_call("c4", "record_finding", {
+                    "item_id": "n", "claim": "3 items", "query_id": "q1", "value": 3})),
+            ]
+            for i in range(5, 17):
+                script.append(_response(_call(f"g{i}", "run_sql", {
+                    "query": "SELECT count(*) FROM items;"})))
+            assert len(script) == 16
+            history: list = []
+            result = answer_question(
+                _StubClient(script), "m", "instr", backend, [], "How many?",
+                runs_dir=Path(tmp) / "runs",
+            )
+            assert "Reached the 16-turn limit" in result.text
+            assert "- n: proven" in result.text
+            assert "- 3 items (3)" in result.text
+            assert "Queries run: 13" in result.text
+            assert "Record: " in result.text
+            assert result.verification == "verification: no submitted answer"
         finally:
             backend.close()
 

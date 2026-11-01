@@ -17,7 +17,7 @@ SCHEMA: dict[str, Any] = {
     "name": NAME,
     "description": (
         "Set the checklist for this turn: one item per question to answer, "
-        "each with the evidence it needs. Call this before update_plan and "
+        "each with the evidence it needs. Call this before plan_action and "
         "any run_sql call. Calling it again replaces the checklist."
     ),
     "parameters": {

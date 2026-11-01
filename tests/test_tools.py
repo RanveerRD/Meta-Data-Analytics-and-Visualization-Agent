@@ -37,18 +37,25 @@ def _make_backend(tmp: str) -> SqliteBackend:
 
 
 def _ctx(backend: SqliteBackend, tmp: str, question: str = "how many?") -> ToolContext:
-    return ToolContext(backend=backend, question=question, runs_dir=Path(tmp) / "runs")
+    return ToolContext(
+        backend=backend,
+        question=question,
+        runs_dir=Path(tmp) / "runs",
+        memory_dir=Path(tmp) / "memory",
+    )
 
 
-def test_registry_lists_all_seven_tools():
+def test_registry_lists_all_tools():
     assert sorted(s["name"] for s in TOOL_SCHEMAS) == [
+        "ask_clarification",
         "get_schema",
         "list_tables",
+        "plan_action",
+        "propose_note",
         "record_finding",
         "run_sql",
         "set_checklist",
         "submit_answer",
-        "update_plan",
     ]
 
 
@@ -103,12 +110,12 @@ def test_run_sql_refused_before_checklist_and_plan():
             refused = json.loads(
                 dispatch(ctx, "run_sql", {"query": "SELECT count(*) FROM items;"})
             )
-            assert "update_plan" in refused["error"]
+            assert "plan_action" in refused["error"]
         finally:
             backend.close()
 
 
-def test_update_plan_rejected_unless_covering():
+def test_plan_action_rejected_unless_covering():
     with tempfile.TemporaryDirectory() as tmp:
         backend = _make_backend(tmp)
         try:
@@ -116,7 +123,7 @@ def test_update_plan_rejected_unless_covering():
             dispatch(ctx, "set_checklist", {"items": ITEMS + [
                 {"id": "other", "question": "q?", "evidence_needed": "e"}
             ]})
-            partial = json.loads(dispatch(ctx, "update_plan", {"plan": PLAN}))
+            partial = json.loads(dispatch(ctx, "plan_action", {"plan": PLAN}))
             assert "missing" in partial["error"]
         finally:
             backend.close()
@@ -128,7 +135,7 @@ def test_queries_recorded_with_ids():
         try:
             ctx = _ctx(backend, tmp)
             dispatch(ctx, "set_checklist", {"items": ITEMS})
-            dispatch(ctx, "update_plan", {"plan": PLAN})
+            dispatch(ctx, "plan_action", {"plan": PLAN})
             first = json.loads(
                 dispatch(ctx, "run_sql", {"query": "SELECT count(*) FROM items;"})
             )
@@ -163,6 +170,155 @@ def test_set_checklist_validation():
             backend.close()
 
 
+def test_run_sql_failure_recorded_with_f_id():
+    with tempfile.TemporaryDirectory() as tmp:
+        backend = _make_backend(tmp)
+        try:
+            ctx = _ctx(backend, tmp)
+            dispatch(ctx, "set_checklist", {"items": ITEMS})
+            dispatch(ctx, "plan_action", {"plan": PLAN})
+            bad = json.loads(
+                dispatch(ctx, "run_sql", {"query": "SELECT * FROM no_such_table;"})
+            )
+            assert "error" in bad
+            assert bad["failed_query_id"] == "f1"
+            assert bad["kind"] == "error"
+            assert [q["id"] for q in ctx.record.queries] == []
+            stored = ctx.record.failed_queries
+            assert [f["id"] for f in stored] == ["f1"]
+            assert stored[0]["kind"] == "error"
+            assert "no_such_table" in stored[0]["sql"]
+            assert stored[0]["error"] == bad["error"]
+            assert "timestamp" in stored[0]
+            assert ctx.record.audit[-1]["action"] == "record_failed_query"
+        finally:
+            backend.close()
+
+
+def test_run_sql_refused_statement_recorded_as_refused():
+    with tempfile.TemporaryDirectory() as tmp:
+        backend = _make_backend(tmp)
+        try:
+            ctx = _ctx(backend, tmp)
+            dispatch(ctx, "set_checklist", {"items": ITEMS})
+            dispatch(ctx, "plan_action", {"plan": PLAN})
+            bad = json.loads(
+                dispatch(ctx, "run_sql", {"query": "SELECT 1; SELECT 2;"})
+            )
+            assert "error" in bad
+            assert bad["kind"] == "refused"
+            assert [f["id"] for f in ctx.record.failed_queries] == ["f1"]
+        finally:
+            backend.close()
+
+
+def test_run_sql_timeout_recorded_as_timeout():
+    class _TimeoutBackend:
+        def run_sql(self, query):
+            raise TimeoutError("query exceeded the 10s limit and was cancelled")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = _ctx(_TimeoutBackend(), tmp)
+        dispatch(ctx, "set_checklist", {"items": ITEMS})
+        dispatch(ctx, "plan_action", {"plan": PLAN})
+        bad = json.loads(dispatch(ctx, "run_sql", {"query": "SELECT 1;"}))
+        assert bad["kind"] == "timeout"
+        assert [f["id"] for f in ctx.record.failed_queries] == ["f1"]
+
+
+def test_record_finding_refuses_failed_query_id():
+    with tempfile.TemporaryDirectory() as tmp:
+        backend = _make_backend(tmp)
+        try:
+            ctx = _ctx(backend, tmp)
+            dispatch(ctx, "set_checklist", {"items": ITEMS})
+            dispatch(ctx, "plan_action", {"plan": PLAN})
+            dispatch(ctx, "run_sql", {"query": "SELECT * FROM no_such_table;"})
+            refused = json.loads(
+                dispatch(
+                    ctx,
+                    "record_finding",
+                    {
+                        "item_id": "count_items",
+                        "claim": "three items",
+                        "query_id": "f1",
+                        "value": 3,
+                    },
+                )
+            )
+            assert "no citable result" in refused["error"]
+            unknown = json.loads(
+                dispatch(
+                    ctx,
+                    "record_finding",
+                    {
+                        "item_id": "count_items",
+                        "claim": "three items",
+                        "query_id": "f99",
+                        "value": 3,
+                    },
+                )
+            )
+            assert "unknown query id" in unknown["error"]
+        finally:
+            backend.close()
+
+
+def _check_schema_shape(schema: dict, path: str) -> None:
+    assert schema.get("strict") is True, f"{path}: strict must be true"
+    params = schema["parameters"]
+    assert params.get("additionalProperties") is False, f"{path}: sealed object required"
+    properties = params.get("properties", {})
+    required = params.get("required", [])
+    for key in properties:
+        assert key in required, f"{path}: {key!r} missing from required"
+    for key, subschema in properties.items():
+        items = subschema.get("items")
+        if isinstance(items, dict) and items.get("type") == "object":
+            _check_schema_shape(
+                {"strict": True, "parameters": items}, f"{path}.{key}[]"
+            )
+
+
+def test_all_tool_schemas_list_every_property_as_required():
+    assert len(TOOL_SCHEMAS) == 9
+    for schema in TOOL_SCHEMAS:
+        _check_schema_shape(schema, schema["name"])
+
+
+def test_optional_fields_accept_explicit_null():
+    with tempfile.TemporaryDirectory() as tmp:
+        backend = _make_backend(tmp)
+        try:
+            ctx = _ctx(backend, tmp)
+            noted = json.loads(
+                dispatch(ctx, "propose_note", {
+                    "kind": "definition", "key": "revenue",
+                    "text": "sum of price", "query_id": None,
+                })
+            )
+            assert noted == {"ok": True, "entry_id": "e1", "status": "proposed"}
+            dispatch(ctx, "set_checklist", {"items": ITEMS})
+            dispatch(ctx, "plan_action", {"plan": PLAN})
+            dispatch(ctx, "run_sql", {"query": "SELECT count(*) FROM items;"})
+            ctx.ask_user = lambda question, options: {"choice": options[0]["label"]}
+            clarified = json.loads(
+                dispatch(ctx, "ask_clarification", {
+                    "question": "Which count?",
+                    "options": [
+                        {"label": "all rows", "query_id": "q1", "evidence": 3,
+                         "explanation": "counts every row"},
+                        {"label": "all rows again", "query_id": "q1", "evidence": 3,
+                         "explanation": "same count again"},
+                    ],
+                    "definition_key": None,
+                })
+            )
+            assert clarified == {"ok": True, "choice": "all rows"}
+        finally:
+            backend.close()
+
+
 def test_unknown_tool():
     with tempfile.TemporaryDirectory() as tmp:
         backend = _make_backend(tmp)
@@ -181,7 +337,9 @@ def test_tools_never_import_a_database_driver():
         "get_schema.py",
         "run_sql.py",
         "set_checklist.py",
-        "update_plan.py",
+        "plan_action.py",
+        "propose_note.py",
+        "ask_clarification.py",
         "record_finding.py",
         "submit_answer.py",
     ):

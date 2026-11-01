@@ -74,6 +74,7 @@ class TurnResult:
     usage_known: bool = True
     record_path: str | None = None
     verification: str | None = None
+    clarification: dict[str, Any] | None = None
 
 
 @dataclass
@@ -180,6 +181,22 @@ def _build_work_summary(ctx: ToolContext) -> str:
     return "\n".join(lines)
 
 
+def _partial_summary(ctx: ToolContext) -> str:
+    """What the turn established before the cap hit: items, findings, counts."""
+    assert ctx.record is not None
+    record = ctx.record
+    lines = ["", "Partial progress:"]
+    for item in record.checklist:
+        lines.append(f"- {item['id']}: {item['status']}")
+    if record.findings:
+        lines.append("Findings:")
+        for finding in record.findings:
+            lines.append(f"- {finding['claim']} ({finding['value']})")
+    lines.append(f"Queries run: {len(record.queries)}")
+    lines.append(f"Record: {_record_display_path(record.path)}")
+    return "\n".join(lines)
+
+
 def _compact_turn_history(
     history: list[dict[str, Any]],
     snapshot: int,
@@ -267,9 +284,12 @@ def answer_question(
     history: list[dict[str, Any]],
     question: str,
     runs_dir: Path = RUNS_DIR,
+    ask_user: Any = None,
 ) -> TurnResult:
     """Ask one question, keeping shared history. At most MAX_TURNS model calls."""
-    ctx = ToolContext(backend=backend, question=question, runs_dir=runs_dir)
+    ctx = ToolContext(
+        backend=backend, question=question, runs_dir=runs_dir, ask_user=ask_user
+    )
     history.append({"role": "user", "content": question})
     snapshot = len(history) - 1
     usage = _Usage()
@@ -312,9 +332,13 @@ def answer_question(
                 break
     submission = ctx.record.submission if ctx.record is not None else None
     record_path = _record_display_path(ctx.record.path) if ctx.record else None
+    clarification = ctx.record.clarification if ctx.record is not None else None
     if capped and submission is None:
+        text = CAP_MESSAGE
+        if ctx.record is not None:
+            text += _partial_summary(ctx)
         return TurnResult(
-            text=CAP_MESSAGE,
+            text=text,
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
             total_tokens=usage.total_tokens,
@@ -323,6 +347,7 @@ def answer_question(
             verification="verification: no submitted answer"
             if ctx.record
             else None,
+            clarification=clarification,
         )
     verification: str | None = None
     if ctx.record is not None:
@@ -350,4 +375,5 @@ def answer_question(
         usage_known=usage.known,
         record_path=record_path,
         verification=verification,
+        clarification=clarification,
     )

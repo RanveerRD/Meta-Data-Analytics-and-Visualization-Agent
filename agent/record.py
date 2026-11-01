@@ -23,6 +23,7 @@ STATUS_ANSWERED = "answered"
 STATUS_ESCALATED = "escalated"
 
 MAX_FINDINGS_PER_ITEM = 3
+MAX_FAILED_QUERIES = 50
 TOLERANCE = 0.005
 
 _ID_RE = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -65,9 +66,9 @@ def validate_checklist_items(items: Any) -> list[dict[str, str]]:
 
 
 def validate_plan(plan: Any, checklist_ids: list[str]) -> list[dict[str, Any]]:
-    """Validate raw update_plan input against the checklist; raise if short."""
+    """Validate raw plan_action input against the checklist; raise if short."""
     if not isinstance(plan, list) or not plan:
-        raise ValueError("update_plan needs a non-empty list of {item_id, steps}")
+        raise ValueError("plan_action needs a non-empty list of {item_id, steps}")
     required = set(checklist_ids)
     covered: set[str] = set()
     cleaned: list[dict[str, Any]] = []
@@ -147,6 +148,18 @@ class AnalysisRecord:
         return copy.deepcopy(self._state["queries"])
 
     @property
+    def clarification(self) -> dict[str, Any] | None:
+        return copy.deepcopy(self._state.get("clarification"))
+
+    @property
+    def clarification_calls(self) -> int:
+        return int(self._state.get("clarification_calls", 0))
+
+    @property
+    def failed_queries(self) -> list[dict[str, Any]]:
+        return copy.deepcopy(self._state.get("failed_queries", []))
+
+    @property
     def findings(self) -> list[dict[str, Any]]:
         return copy.deepcopy(self._state["findings"])
 
@@ -182,9 +195,23 @@ class AnalysisRecord:
 
         Findings for items that no longer exist are dropped; the rejected
         list is append-only history and stays. A prior submission belongs to
-        the old checklist, so it and the rejection counter reset.
+        the old checklist, so it and the rejection counter reset. Refused
+        when the new list drops an existing item that is not yet proven.
         """
-        self._state["checklist"] = validate_checklist_items(items)
+        cleaned = validate_checklist_items(items)
+        if self._state["checklist"]:
+            existing = {c["id"]: c for c in self._state["checklist"]}
+            kept = {c["id"] for c in cleaned}
+            dropped_unproven = sorted(
+                i for i, c in existing.items()
+                if i not in kept and c.get("status") != STATUS_PROVEN
+            )
+            if dropped_unproven:
+                raise ValueError(
+                    f"set_checklist refuses to drop unproven items: {dropped_unproven}; "
+                    "include the existing unproven items and add any new ones"
+                )
+        self._state["checklist"] = cleaned
         self._state["plan"] = []
         kept = {c["id"] for c in self._state["checklist"]}
         self._state["findings"] = [
@@ -192,17 +219,45 @@ class AnalysisRecord:
         ]
         self._state["submission"] = None
         self._state["rejections"] = 0
+        self._state["clarification"] = None
         self._append_audit("set_checklist", {"items": [c["id"] for c in self._state["checklist"]]})
         self.save()
         return self
 
-    def update_plan(self, plan: Any) -> AnalysisRecord:
+    def plan_action(self, plan: Any) -> AnalysisRecord:
         """Store a plan covering every checklist item; save."""
         checklist_ids = [c["id"] for c in self._state["checklist"]]
         self._state["plan"] = validate_plan(plan, checklist_ids)
-        self._append_audit("update_plan", {"items": [p["item_id"] for p in self._state["plan"]]})
+        self._append_audit("plan_action", {"items": [p["item_id"] for p in self._state["plan"]]})
         self.save()
         return self
+
+    def record_failed_query(self, sql: str, error: str, kind: str) -> str:
+        """Store a failed query attempt; return its id (f1, f2, ...).
+
+        Failed queries never receive q ids and can never be cited by
+        record_finding. The list is capped at the most recent
+        MAX_FAILED_QUERIES entries; every failure is still audited.
+        """
+        seq = int(self._state.get("failed_seq", 0)) + 1
+        self._state["failed_seq"] = seq
+        failed_id = f"f{seq}"
+        failed = self._state.setdefault("failed_queries", [])
+        failed.append(
+            {
+                "id": failed_id,
+                "sql": sql,
+                "error": error,
+                "kind": kind,
+                "timestamp": _utc_now_iso(),
+            }
+        )
+        del failed[: max(0, len(failed) - MAX_FAILED_QUERIES)]
+        self._append_audit(
+            "record_failed_query", {"id": failed_id, "kind": kind}
+        )
+        self.save()
+        return failed_id
 
     def record_query(self, sql: str, result: dict[str, Any]) -> str:
         """Store a successful query result; return its id (q1, q2, ...)."""
@@ -222,6 +277,62 @@ class AnalysisRecord:
         self.save()
         return query_id
 
+    def value_in_query(self, query_id: Any, value: Any) -> bool:
+        """True when value appears in the named successful query's rows."""
+        for query in self._state["queries"]:
+            if query["id"] == query_id:
+                cells = [v for row in query["rows"] for v in row]
+                return _value_in_rows(value, cells)
+        return False
+
+    def store_clarification(
+        self,
+        question: str,
+        options: list[dict[str, Any]],
+        reply: str,
+        definition_key: str | None,
+    ) -> dict[str, Any]:
+        """Store a clarification choice; each pause counts toward the budget."""
+        self._state["clarification"] = {
+            "question": question,
+            "options": copy.deepcopy(options),
+            "reply": reply,
+            "definition_key": definition_key,
+            "timestamp": _utc_now_iso(),
+        }
+        self._state["clarification_calls"] = self.clarification_calls + 1
+        self._append_audit("ask_clarification", {"reply": reply})
+        self.save()
+        return {"ok": True, "choice": reply}
+
+    def note_clarification_question(self, text: str) -> dict[str, Any]:
+        """Record a user question asked instead of a choice; counts as a call."""
+        self._state["clarification_calls"] = self.clarification_calls + 1
+        self._append_audit("clarification_question", {"question": text})
+        self.save()
+        return {
+            "ok": True,
+            "user_question": text,
+            "guidance": (
+                "Answer this briefly using the queries already recorded, "
+                "do not start a new checklist, then call ask_clarification "
+                "again with the same options."
+            ),
+        }
+
+    def refuse_clarification(self, reason: str) -> dict[str, Any]:
+        """Record a refused clarification attempt; save."""
+        self._state.setdefault("rejected", []).append(
+            {
+                "tool": "ask_clarification",
+                "reason": reason,
+                "timestamp": _utc_now_iso(),
+            }
+        )
+        self._append_audit("clarification_rejected", {"reason": reason})
+        self.save()
+        return {"error": reason}
+
     def item_ids(self) -> list[str]:
         """Ids on the current checklist."""
         return [c["id"] for c in self._state["checklist"]]
@@ -238,6 +349,12 @@ class AnalysisRecord:
         known_items = {c["id"] for c in self._state["checklist"]}
         if item_id not in known_items:
             return f"unknown checklist item: {item_id!r}"
+        failed_ids = {f["id"] for f in self._state.get("failed_queries", [])}
+        if query_id in failed_ids:
+            return (
+                f"query {query_id!r} failed and has no citable result; "
+                "cite a successful q-id instead"
+            )
         known_queries = {q["id"] for q in self._state["queries"]}
         if query_id not in known_queries:
             return f"unknown query id: {query_id!r}"
@@ -360,8 +477,12 @@ class AnalysisRecord:
             "checklist": self._state["checklist"],
             "plan": self._state["plan"],
             "queries": self._state["queries"],
+            "failed_queries": self._state.get("failed_queries", []),
+            "failed_seq": self._state.get("failed_seq", 0),
             "findings": self._state["findings"],
             "rejected": self._state.get("rejected", []),
+            "clarification": self._state.get("clarification"),
+            "clarification_calls": self._state.get("clarification_calls", 0),
             "submission": self._state.get("submission"),
             "rejections": self._state.get("rejections", 0),
             "audit": self._state["audit"],
@@ -404,8 +525,12 @@ def _blank_state(question: str) -> dict[str, Any]:
         "checklist": [],
         "plan": [],
         "queries": [],
+        "failed_queries": [],
+        "failed_seq": 0,
         "findings": [],
         "rejected": [],
+        "clarification": None,
+        "clarification_calls": 0,
         "submission": None,
         "rejections": 0,
         "audit": [],
