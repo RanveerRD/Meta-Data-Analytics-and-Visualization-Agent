@@ -25,12 +25,12 @@ MEMORY_DIR = REPO_ROOT / "workspace" / "memory"
 DEFAULT_DATASET = "olist"
 
 KINDS = ("definition", "quirk")
-STATUSES = ("proposed", "approved", "rejected")
+STATUSES = ("proposed", "approved", "rejected", "retired")
 
 _KEY_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 MAX_TEXT_LEN = 300
 
-PROMPT_HEADER = "Approved definitions (always follow these, and name them in your assumptions)"
+PROMPT_HEADER = "Last-used definitions (offer as defaults, still confirm with ask_clarification)"
 
 
 def _utc_now_iso() -> str:
@@ -185,9 +185,19 @@ class DefinitionStore:
         evidence: Any = None,
         decided_by: str = "user",
     ) -> dict[str, Any]:
-        """Create an already-approved definition. Console use only, never a tool."""
+        """Create an already-approved definition. Console use only, never a tool.
+
+        A key that already has an approved entry retires the old one first,
+        so the key always ends with exactly one approved entry.
+        """
         cleaned_evidence = _validate_entry_fields("definition", key, text, evidence)
-        self._check_one_approved(key, None)
+        for old in self._state["entries"]:
+            if old["key"] == key and old["status"] == "approved":
+                old["status"] = "retired"
+                old["decided_at"] = _utc_now_iso()
+                old["decided_by"] = decided_by
+                self._append_audit("note_retired", {"id": old["id"], "key": key})
+                break
         entry = {
             "id": f"e{int(self._state.get('entry_seq', 0)) + 1}",
             "kind": "definition",
@@ -202,6 +212,24 @@ class DefinitionStore:
         self._state["entry_seq"] = int(self._state.get("entry_seq", 0)) + 1
         self._state["entries"].append(entry)
         self._append_audit("note_approved", {"id": entry["id"], "key": key})
+        self.save()
+        return copy.deepcopy(entry)
+
+    def retire(self, key: Any, decided_by: str = "user") -> dict[str, Any]:
+        """Retire the approved entry for a key, keeping it in the file.
+
+        Console use only, never a tool. Retired entries leave the system
+        prompt and free the key for a new definition.
+        """
+        for entry in self._state["entries"]:
+            if entry["key"] == key and entry["status"] == "approved":
+                break
+        else:
+            raise ValueError(f"no approved entry for key {key!r}")
+        entry["status"] = "retired"
+        entry["decided_at"] = _utc_now_iso()
+        entry["decided_by"] = decided_by
+        self._append_audit("note_retired", {"id": entry["id"], "key": key})
         self.save()
         return copy.deepcopy(entry)
 

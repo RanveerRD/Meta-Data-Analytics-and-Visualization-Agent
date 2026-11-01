@@ -152,6 +152,10 @@ class AnalysisRecord:
         return copy.deepcopy(self._state.get("clarification"))
 
     @property
+    def clarifications(self) -> list[dict[str, Any]]:
+        return copy.deepcopy(self._state.get("clarifications", []))
+
+    @property
     def clarification_calls(self) -> int:
         return int(self._state.get("clarification_calls", 0))
 
@@ -293,22 +297,34 @@ class AnalysisRecord:
         definition_key: str | None,
     ) -> dict[str, Any]:
         """Store a clarification choice; each pause counts toward the budget."""
-        self._state["clarification"] = {
+        entry = {
+            "id": f"c{self.clarification_calls + 1}",
             "question": question,
             "options": copy.deepcopy(options),
             "reply": reply,
             "definition_key": definition_key,
             "timestamp": _utc_now_iso(),
         }
+        self._state.setdefault("clarifications", []).append(entry)
+        self._state["clarification"] = copy.deepcopy(entry)
         self._state["clarification_calls"] = self.clarification_calls + 1
-        self._append_audit("ask_clarification", {"reply": reply})
+        self._append_audit("ask_clarification", {"id": entry["id"], "reply": reply})
         self.save()
         return {"ok": True, "choice": reply}
 
     def note_clarification_question(self, text: str) -> dict[str, Any]:
         """Record a user question asked instead of a choice; counts as a call."""
+        entry = {
+            "id": f"c{self.clarification_calls + 1}",
+            "question": None,
+            "options": [],
+            "reply": text,
+            "definition_key": None,
+            "timestamp": _utc_now_iso(),
+        }
+        self._state.setdefault("clarifications", []).append(entry)
         self._state["clarification_calls"] = self.clarification_calls + 1
-        self._append_audit("clarification_question", {"question": text})
+        self._append_audit("clarification_question", {"id": entry["id"], "question": text})
         self.save()
         return {
             "ok": True,
@@ -413,7 +429,7 @@ class AnalysisRecord:
     def submit(
         self,
         answer: str,
-        assumptions: Any,
+        decisions: Any,
         gaps: Any,
         matched: list[str],
         unmatched: list[str],
@@ -422,7 +438,7 @@ class AnalysisRecord:
         """Store the accepted answer. Called only after all gates pass."""
         submission = {
             "answer": answer,
-            "assumptions": list(assumptions),
+            "decisions": list(decisions),
             "gaps": list(gaps),
             "rejections": self.rejections,
             "status": status,
@@ -482,6 +498,7 @@ class AnalysisRecord:
             "findings": self._state["findings"],
             "rejected": self._state.get("rejected", []),
             "clarification": self._state.get("clarification"),
+            "clarifications": self._state.get("clarifications", []),
             "clarification_calls": self._state.get("clarification_calls", 0),
             "submission": self._state.get("submission"),
             "rejections": self._state.get("rejections", 0),
@@ -530,6 +547,7 @@ def _blank_state(question: str) -> dict[str, Any]:
         "findings": [],
         "rejected": [],
         "clarification": None,
+        "clarifications": [],
         "clarification_calls": 0,
         "submission": None,
         "rejections": 0,

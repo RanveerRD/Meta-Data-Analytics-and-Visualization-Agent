@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from agent.__main__ import (  # noqa: E402
     _console_ask_user,
+    _definition_text,
     _format_evidence,
     _offer_definition_save,
 )
@@ -64,6 +65,7 @@ def _ctx(backend: SqliteBackend, tmp: str, ask_user=None) -> ToolContext:
         backend=backend,
         question="What is revenue?",
         runs_dir=Path(tmp) / "runs",
+        memory_dir=Path(tmp) / "memory",
         ask_user=ask_user,
     )
 
@@ -250,7 +252,7 @@ def test_user_question_returned_with_guidance():
             backend.close()
 
 
-def test_fourth_clarification_refused():
+def test_sixth_clarification_refused():
     with tempfile.TemporaryDirectory() as tmp:
         backend = _make_backend(tmp)
         try:
@@ -263,13 +265,12 @@ def test_fourth_clarification_refused():
                 return {"choice": options[0]["label"]}
 
             ctx = _ready_ctx(backend, tmp, ask_user=_ask)
-            assert json.loads(dispatch(ctx, "ask_clarification", dict(ASK)))["ok"]
-            assert json.loads(dispatch(ctx, "ask_clarification", dict(ASK)))["ok"]
-            assert json.loads(dispatch(ctx, "ask_clarification", dict(ASK)))["ok"]
-            assert ctx.record.clarification_calls == 3
-            fourth = json.loads(dispatch(ctx, "ask_clarification", dict(ASK)))
-            assert "three clarifications" in fourth["error"]
-            assert calls["n"] == 3
+            for _ in range(5):
+                assert json.loads(dispatch(ctx, "ask_clarification", dict(ASK)))["ok"]
+            assert ctx.record.clarification_calls == 5
+            sixth = json.loads(dispatch(ctx, "ask_clarification", dict(ASK)))
+            assert "five clarifications" in sixth["error"]
+            assert calls["n"] == 5
         finally:
             backend.close()
 
@@ -284,21 +285,46 @@ def test_set_checklist_between_clarifications_keeps_budget():
                 {"id": "extra", "question": "More?", "evidence_needed": "more rows"}
             ]})
             assert ctx.record.clarification_calls == 1
-            assert json.loads(dispatch(ctx, "ask_clarification", dict(ASK)))["ok"]
-            assert json.loads(dispatch(ctx, "ask_clarification", dict(ASK)))["ok"]
-            fourth = json.loads(dispatch(ctx, "ask_clarification", dict(ASK)))
-            assert "three clarifications" in fourth["error"]
+            for _ in range(4):
+                assert json.loads(dispatch(ctx, "ask_clarification", dict(ASK)))["ok"]
+            sixth = json.loads(dispatch(ctx, "ask_clarification", dict(ASK)))
+            assert "five clarifications" in sixth["error"]
         finally:
             backend.close()
 
 
-def test_no_callback_returns_state_assumption_error():
+def test_last_used_option_marked_from_saved_definition():
+    with tempfile.TemporaryDirectory() as tmp:
+        backend = _make_backend(tmp)
+        try:
+            from agent.preliminary_analysis import approve_definition
+            approve_definition(
+                "revenue", "delivered only: excludes shipping fees",
+                memory_dir=Path(tmp) / "memory",
+            )
+            seen = {}
+
+            def _ask(question, options):
+                seen["options"] = options
+                return {"choice": options[0]["label"]}
+
+            ctx = _ready_ctx(backend, tmp, ask_user=_ask)
+            assert json.loads(dispatch(ctx, "ask_clarification", dict(ASK)))["ok"]
+            assert seen["options"][0].get("last_used") is True
+            assert "last_used" not in seen["options"][1]
+            stored = ctx.record.clarification
+            assert stored["options"][0].get("last_used") is True
+        finally:
+            backend.close()
+
+
+def test_no_callback_returns_state_decisions_error():
     with tempfile.TemporaryDirectory() as tmp:
         backend = _make_backend(tmp)
         try:
             ctx = _ready_ctx(backend, tmp, ask_user=None)
             result = json.loads(dispatch(ctx, "ask_clarification", dict(ASK)))
-            assert "State your assumption" in result["error"]
+            assert "State your decisions" in result["error"]
             assert ctx.record.clarification is None
             assert ctx.record.clarification_calls == 0
         finally:
@@ -383,6 +409,67 @@ def test_console_text_is_a_user_question():
     assert reply == {"user_question": "what about canceled?"}
 
 
+def test_console_shows_last_used_and_enter_selects_it(capsys):
+    options = [dict(OPTIONS[0], last_used=True), dict(OPTIONS[1])]
+    reply = _console_ask_user(ASK["question"], options, input_fn=_inputs(""))
+    assert reply == {"choice": "delivered only"}
+    assert "(last used)" in capsys.readouterr().out
+
+
+def test_console_empty_without_last_used_reprompts(capsys):
+    reply = _console_ask_user(
+        ASK["question"], OPTIONS, input_fn=_inputs("", "2"))
+    assert reply == {"choice": "delivered and shipped"}
+    assert "pick 1 to 2" in capsys.readouterr().out
+
+
+def test_offer_save_skipped_for_last_used_choice():
+    asked = []
+
+    def _approve(key, text, evidence):
+        raise AssertionError("approve must not be called")
+
+    clarification = {
+        "question": ASK["question"],
+        "options": [dict(OPTIONS[0], last_used=True), dict(OPTIONS[1])],
+        "reply": "delivered only",
+        "definition_key": "revenue",
+    }
+    assert _offer_definition_save(
+        clarification, ask=lambda p: asked.append(p) or "y", approve=_approve
+    ) is False
+    assert asked == []
+
+
+def test_offer_save_prompt_uses_new_default_wording(capsys):
+    saved = {}
+    prompts = []
+
+    def _approve(key, text, evidence):
+        saved["args"] = (key, text, evidence)
+        return {"key": key, "text": text}
+
+    clarification = {
+        "question": ASK["question"],
+        "options": OPTIONS,
+        "reply": "delivered and shipped",
+        "definition_key": "revenue",
+    }
+    assert _offer_definition_save(
+        clarification, ask=lambda p: prompts.append(p) or "y", approve=_approve
+    ) is True
+    assert "Save as the new default" in prompts[0]
+    assert "approved revenue" in capsys.readouterr().out
+    assert saved["args"][0] == "revenue"
+
+
+def test_instructions_require_asking_every_time():
+    text = (Path(__file__).resolve().parent.parent / "agent" / "instructions.md").read_text()
+    assert "do not ask when an approved definition exists" not in text
+    assert "EVERY time, even if a saved definition exists" in text
+    assert "top_metric" in text
+
+
 def test_loop_continues_same_turn_after_reply():
     with tempfile.TemporaryDirectory() as tmp:
         backend = _make_backend(tmp)
@@ -434,7 +521,38 @@ def test_offer_definition_save_only_with_key():
     assert _offer_definition_save(
         clarification, ask=lambda p: "y", approve=_approve
     ) is True
-    assert saved["args"] == ("revenue", "delivered only", ["q1"])
+    assert saved["args"] == (
+        "revenue", "delivered only: excludes shipping fees", ["q1"])
+
+
+def test_definition_text_prefers_option_explanation():
+    assert _definition_text({
+        "reply": "delivered only",
+        "options": OPTIONS,
+    }) == "delivered only: excludes shipping fees"
+    assert _definition_text({
+        "reply": "my own reading",
+        "options": OPTIONS,
+    }) == "my own reading"
+
+
+def test_offer_definition_save_stores_typed_answer_verbatim():
+    saved = {}
+
+    def _approve(key, text, evidence):
+        saved["args"] = (key, text, evidence)
+        return {"key": key, "text": text}
+
+    clarification = {
+        "question": ASK["question"],
+        "options": OPTIONS,
+        "reply": "only high-value delivered",
+        "definition_key": "revenue",
+    }
+    assert _offer_definition_save(
+        clarification, ask=lambda p: "y", approve=_approve
+    ) is True
+    assert saved["args"] == ("revenue", "only high-value delivered", ["q1"])
 
 
 if __name__ == "__main__":

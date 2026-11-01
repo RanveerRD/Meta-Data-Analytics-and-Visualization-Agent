@@ -2,7 +2,7 @@
 
 Every option must cite a successful query from this turn's record, and every
 number in the question or labels must already appear in a recorded result.
-At most one clarification per question; a second call is refused.
+At most five clarifications per question; further calls are refused.
 """
 
 from __future__ import annotations
@@ -12,6 +12,11 @@ import re
 from typing import TYPE_CHECKING, Any
 
 from agent.numbers import verify_text
+from agent.preliminary_analysis import (
+    DEFAULT_DATASET,
+    MEMORY_DIR,
+    DefinitionStore,
+)
 
 if TYPE_CHECKING:
     from agent.tools import ToolContext
@@ -25,7 +30,7 @@ SCHEMA: dict[str, Any] = {
         "Ask the user to choose between readings you already queried. Each "
         "option cites its query id, one evidence value from that query's "
         "stored result, and a one-sentence explanation; options never "
-        "invented. Call at most three times per question, after running "
+        "invented. Call at most five times per question, after running "
         "the queries, before final figures."
     ),
     "parameters": {
@@ -74,13 +79,13 @@ SCHEMA: dict[str, Any] = {
 
 _MISSING_RECORD_ERROR = "ask_clarification is refused: call set_checklist first."
 _BUDGET_ERROR = (
-    "ask_clarification is refused: three clarifications already used for "
+    "ask_clarification is refused: five clarifications already used for "
     "this question; proceed with the choice already made, or with your best "
-    "reading stated in the assumptions."
+    "reading stated in the decisions."
 )
 _NO_CALLBACK_ERROR = (
     "ask_clarification is unavailable in this session: no user to ask. "
-    "State your assumption in submit_answer instead."
+    "State your decisions in submit_answer instead."
 )
 
 _KEY_RE = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -89,6 +94,28 @@ _KEY_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 def _refuse(ctx: ToolContext, reason: str) -> str:
     assert ctx.record is not None
     return json.dumps(ctx.record.refuse_clarification(reason))
+
+
+def _mark_last_used(
+    ctx: ToolContext, cleaned: list[dict[str, Any]], definition_key: str
+) -> None:
+    """Flag the option matching the saved default, in tool code, never the model."""
+    memory_dir = ctx.memory_dir if ctx.memory_dir is not None else MEMORY_DIR
+    try:
+        store = DefinitionStore.load(DEFAULT_DATASET, memory_dir)
+    except OSError:
+        return
+    saved = ""
+    for entry in store.approved_entries():
+        if entry["key"] == definition_key:
+            saved = entry["text"]
+            break
+    if not saved:
+        return
+    for option in cleaned:
+        if saved.startswith(option["label"]):
+            option["last_used"] = True
+            return
 
 
 def run(ctx: ToolContext, args: dict[str, Any]) -> str:
@@ -150,7 +177,9 @@ def run(ctx: ToolContext, args: dict[str, Any]) -> str:
         _, unmatched = verify_text(text, record.question, cells)
         if unmatched:
             return _refuse(ctx, f"unmatched numbers: {unmatched}")
-    if record.clarification_calls >= 3:
+    if definition_key is not None:
+        _mark_last_used(ctx, cleaned, definition_key)
+    if record.clarification_calls >= 5:
         return json.dumps(record.refuse_clarification(_BUDGET_ERROR))
     if ctx.ask_user is None:
         return json.dumps({"error": _NO_CALLBACK_ERROR})

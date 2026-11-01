@@ -30,10 +30,38 @@ SCHEMA: dict[str, Any] = {
                 "type": "string",
                 "description": "The full answer text for the user.",
             },
-            "assumptions": {
+            "decisions": {
                 "type": "array",
-                "description": "Assumptions stated briefly.",
-                "items": {"type": "string"},
+                "description": (
+                    "Every choice that could change a number: what it is, "
+                    "the choice made, its source and its proof."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "what": {
+                            "type": "string",
+                            "description": "What was decided.",
+                        },
+                        "choice": {
+                            "type": "string",
+                            "description": "The choice made.",
+                        },
+                        "source": {
+                            "type": "string",
+                            "description": "One of user_stated, user_chosen, only_option.",
+                        },
+                        "proof": {
+                            "type": "string",
+                            "description": (
+                                "Quote from the question, clarification id, "
+                                "or recorded query id."
+                            ),
+                        },
+                    },
+                    "required": ["what", "choice", "source", "proof"],
+                    "additionalProperties": False,
+                },
             },
             "gaps": {
                 "type": "array",
@@ -55,7 +83,7 @@ SCHEMA: dict[str, Any] = {
                 },
             },
         },
-        "required": ["answer", "assumptions", "gaps"],
+        "required": ["answer", "decisions", "gaps"],
         "additionalProperties": False,
     },
     "strict": True,
@@ -63,6 +91,101 @@ SCHEMA: dict[str, Any] = {
 
 _MISSING_RECORD_ERROR = "submit_answer is refused: call set_checklist first."
 _MAX_REJECTIONS = 3
+
+_SOURCES = ("user_stated", "user_chosen", "only_option")
+
+
+def _validate_decisions(
+    decisions: Any, record
+) -> tuple[list[dict[str, Any]] | None, list[int], str | None]:
+    """Check each decision's proof. Return (normalized, failed, error).
+
+    normalized holds every submitted decision in shape; failed lists the
+    indexes whose proof check failed so escalation can mark them
+    UNCONFIRMED instead of storing a bare rejection.
+    """
+    if not isinstance(decisions, list) or not decisions:
+        return [], [], "submit_answer needs a non-empty list of decisions"
+    known_clarifications = {c["id"]: c for c in record.clarifications}
+    known_queries = {q["id"] for q in record.queries}
+    normalized: list[dict[str, Any]] = []
+    failed: list[int] = []
+    first_error = ""
+    for i, entry in enumerate(decisions):
+        if not isinstance(entry, dict):
+            normalized.append({"what": "?", "choice": "?", "source": "?", "proof": "?"})
+            failed.append(i)
+            if len(failed) == 1:
+                first_error = f"decision {i} must be an object with what, choice, source, proof"
+            continue
+        what = entry.get("what")
+        choice = entry.get("choice")
+        source = entry.get("source")
+        proof = entry.get("proof")
+        if (
+            not isinstance(what, str)
+            or not what.strip()
+            or not isinstance(choice, str)
+            or not choice.strip()
+            or not isinstance(proof, str)
+            or not proof.strip()
+        ):
+            normalized.append(
+                {
+                    "what": what if isinstance(what, str) else "?",
+                    "choice": choice if isinstance(choice, str) else "?",
+                    "source": source if isinstance(source, str) else "?",
+                    "proof": proof if isinstance(proof, str) else "?",
+                }
+            )
+            failed.append(i)
+            if len(failed) == 1:
+                first_error = f"decision {i} needs non-empty what, choice and proof"
+            continue
+        problem: str | None = None
+        if source not in _SOURCES:
+            problem = (
+                f"unknown source {source!r}; use user_stated, user_chosen "
+                "or only_option, or ask via ask_clarification"
+            )
+        elif source == "user_stated":
+            if len(proof.strip()) < 4 or proof.strip().lower() not in record.question.lower():
+                problem = (
+                    "user_stated proof must be a quote of at least 4 characters "
+                    "from the user's question"
+                )
+        elif source == "user_chosen":
+            clarification = known_clarifications.get(proof.strip())
+            if clarification is None:
+                problem = (
+                    f"unknown clarification {proof.strip()!r}; "
+                    "ask via ask_clarification"
+                )
+            else:
+                reply = clarification["reply"].strip().lower()
+                made = choice.strip().lower()
+                if reply != made and reply not in made and made not in reply:
+                    problem = (
+                        f"choice does not match clarification {proof.strip()}'s reply; "
+                        "ask via ask_clarification"
+                    )
+        elif proof.strip() not in known_queries:
+            problem = f"unknown query {proof.strip()!r}"
+        normalized.append(
+            {
+                "what": what.strip(),
+                "choice": choice.strip(),
+                "source": source if isinstance(source, str) else "?",
+                "proof": proof.strip(),
+            }
+        )
+        if problem is not None:
+            failed.append(i)
+            if len(failed) == 1:
+                first_error = f"decision {i} ({what.strip()}): {problem}"
+    if failed:
+        return normalized, failed, first_error
+    return normalized, [], None
 
 
 def _validate_gaps(gaps: Any, item_ids: list[str]) -> list[dict[str, str]] | str:
@@ -93,18 +216,9 @@ def run(ctx: ToolContext, args: dict[str, Any]) -> str:
     answer = args.get("answer")
     if not isinstance(answer, str) or not answer.strip():
         return json.dumps({"error": "submit_answer needs a non-empty answer"})
-    assumptions = args.get("assumptions", [])
-    if not isinstance(assumptions, list) or any(
-        not isinstance(a, str) for a in assumptions
-    ):
-        return json.dumps({"error": "assumptions must be a list of strings"})
-    if not any(a.strip() for a in assumptions):
-        return json.dumps(
-            {
-                "error": "submit_answer needs at least one assumption: "
-                "state the order-status and date-range choices explicitly"
-            }
-        )
+    decisions, failed, error = _validate_decisions(args.get("decisions", []), record)
+    if error is not None:
+        return _reject(record, error, [], answer, decisions, [], failed)
     gaps = _validate_gaps(args.get("gaps", []), record.item_ids())
     if isinstance(gaps, str):
         return json.dumps({"error": gaps})
@@ -116,13 +230,13 @@ def run(ctx: ToolContext, args: dict[str, Any]) -> str:
     ]
     if uncovered:
         reason = f"uncovered checklist items: {uncovered}"
-        return _reject(record, reason, [], answer, assumptions, gaps)
+        return _reject(record, reason, [], answer, decisions, gaps)
     cells = [v for q in record.queries for row in q["rows"] for v in row]
     matched, unmatched = verify_text(answer, record.question, cells)
     if unmatched:
         reason = f"unmatched numbers: {unmatched}"
-        return _reject(record, reason, unmatched, answer, assumptions, gaps)
-    result = record.submit(answer, assumptions, gaps, matched, unmatched)
+        return _reject(record, reason, unmatched, answer, decisions, gaps)
+    result = record.submit(answer, decisions, gaps, matched, unmatched)
     return json.dumps(result)
 
 
@@ -131,20 +245,31 @@ def _reject(
     reason: str,
     unmatched: list[str],
     answer: str,
-    assumptions: list[str],
+    decisions: list[dict[str, Any]] | None,
     gaps: list[dict[str, str]],
+    failed: list[int] | None = None,
 ) -> str:
     """Count the rejection; escalate-accept once the limit is reached."""
     total = record.note_rejection(reason, unmatched)
     if total >= _MAX_REJECTIONS:
-        warning = f"UNVERIFIED NUMBERS: {unmatched or reason}"
+        failed = failed or []
+        stored = []
+        for i, decision in enumerate(decisions or []):
+            marked = dict(decision)
+            if i in failed:
+                marked["unconfirmed"] = True
+            stored.append(marked)
         result = record.submit(
             answer,
-            assumptions=list(assumptions),
+            decisions=stored,
             gaps=list(gaps),
             matched=[],
             unmatched=list(unmatched),
             status=STATUS_ESCALATED,
         )
-        return json.dumps({**result, "warning": warning})
+        warnings = [f"UNVERIFIED NUMBERS: {unmatched or reason}"]
+        whats = [d["what"] for d in stored if d.get("unconfirmed")]
+        if whats:
+            warnings.append(f"UNCONFIRMED DECISIONS: {whats}")
+        return json.dumps({**result, "warning": " ; ".join(warnings)})
     return json.dumps({"error": reason, "unmatched": unmatched, "rejections": total})

@@ -6,6 +6,7 @@ from agent.backend import SqliteBackend
 from agent.loop import REPO_ROOT, answer_question, build_client
 from agent.preliminary_analysis import (
     DEFAULT_DATASET,
+    MEMORY_DIR,
     DefinitionStore,
     approve_definition,
 )
@@ -27,30 +28,28 @@ def _instructions_for_question(base: str) -> str:
     return base + "\n\n" + section
 
 
-def _handle_command(line: str) -> bool:
+def _handle_command(line: str, memory_dir=MEMORY_DIR) -> bool:
     """Run a / command. Returns True when the line was a command."""
     if not line.startswith("/"):
         return False
     if line == "/notes":
-        approved = DefinitionStore.load(DEFAULT_DATASET).approved_entries()
+        approved = DefinitionStore.load(DEFAULT_DATASET, memory_dir).approved_entries()
         if not approved:
             print("no approved notes yet")
         for entry in approved:
             print(f"- {entry['key']} ({entry['kind']}): {entry['text']}")
         return True
-    if line.startswith("/define "):
-        rest = line[len("/define "):]
-        key, sep, text = rest.partition("=")
+    if line.startswith("/forget "):
+        key = line[len("/forget "):].strip()
         try:
-            if not sep:
-                raise ValueError("use /define <key> = <text>")
-            entry = approve_definition(key.strip(), text.strip())
+            store = DefinitionStore.load(DEFAULT_DATASET, memory_dir)
+            entry = store.retire(key)
         except ValueError as exc:
             print(f"error: {exc}")
         else:
-            print(f"approved {entry['key']}: {entry['text']}")
+            print(f"retired {entry['key']}: {entry['text']}")
         return True
-    print("unknown command (try /define <key> = <text> or /notes)")
+    print("unknown command (try /notes or /forget <key>)")
     return True
 
 
@@ -77,7 +76,8 @@ def _console_ask_user(
     labels = [o["label"] for o in options]
     print(f"clarification: {question}")
     for i, option in enumerate(options, 1):
-        print(f"  {i}. {option['label']} [{_format_evidence(option['evidence'])}]")
+        marker = " (last used)" if option.get("last_used") else ""
+        print(f"  {i}. {option['label']} [{_format_evidence(option['evidence'])}]{marker}")
         print(f"     {option['explanation']}")
     print("  0. something else (type your own)")
     while True:
@@ -93,10 +93,29 @@ def _console_ask_user(
             index = -1
         if 1 <= index <= len(labels):
             return {"choice": labels[index - 1]}
-        if reply == "" or reply.isdigit():
+        if reply == "":
+            for option in options:
+                if option.get("last_used"):
+                    return {"choice": option["label"]}
+            print(f"pick 1 to {len(labels)}, or 0 to type your own")
+            continue
+        if reply.isdigit():
             print(f"pick 1 to {len(labels)}, or 0 to type your own")
             continue
         return {"user_question": reply}
+
+
+def _definition_text(clarification: dict) -> str:
+    """Text to save for a clarification choice.
+
+    An option pick saves as "<label>: <explanation>"; a typed answer, which
+    matches no option label, saves as typed.
+    """
+    reply = clarification["reply"]
+    for option in clarification.get("options", []):
+        if option.get("label") == reply:
+            return f"{reply}: {option.get('explanation', '')}".strip()
+    return reply
 
 
 def _offer_definition_save(
@@ -111,9 +130,12 @@ def _offer_definition_save(
     if not clarification or not clarification.get("definition_key"):
         return False
     key = clarification["definition_key"]
+    for option in clarification.get("options", []):
+        if option.get("last_used") and option.get("label") == clarification["reply"]:
+            return False
     try:
         reply = ask(
-            f"Save this as the default definition for {key}? (y/n) "
+            f"Save as the new default for {key}? (y/n) "
         ).strip().lower()
     except EOFError:
         return False
@@ -121,7 +143,7 @@ def _offer_definition_save(
         return False
     evidence = sorted({o["query_id"] for o in clarification.get("options", [])})
     try:
-        entry = approve(key, clarification["reply"], evidence)
+        entry = approve(key, _definition_text(clarification), evidence)
     except ValueError as exc:
         print(f"error: {exc}")
         return False

@@ -17,6 +17,7 @@ from agent.preliminary_analysis import (  # noqa: E402
     DefinitionStore,
     approve_definition,
 )
+from agent.__main__ import _handle_command  # noqa: E402
 from agent.tools import TOOL_SCHEMAS, ToolContext, dispatch  # noqa: E402
 from agent.backend import SqliteBackend  # noqa: E402
 
@@ -67,6 +68,8 @@ def test_model_tool_can_only_propose():
     names = [s["name"] for s in TOOL_SCHEMAS]
     assert "propose_note" in names
     assert "approve_definition" not in names
+    assert "retire" not in names
+    assert "forget" not in names
     with tempfile.TemporaryDirectory() as tmp:
         backend = _make_backend(tmp)
         try:
@@ -146,27 +149,30 @@ def test_rejected_key_blocks_same_proposal():
         assert entry["id"] == "e2"
 
 
-def test_one_approved_entry_per_key():
+def test_saving_new_definition_retires_old():
     with tempfile.TemporaryDirectory() as tmp:
         first = approve_definition("revenue", "sum of price", memory_dir=tmp)
         assert first["status"] == "approved"
+        second = approve_definition(
+            "revenue", "sum of price and freight", memory_dir=tmp
+        )
+        assert second["status"] == "approved"
+        reloaded = DefinitionStore.load(DEFAULT_DATASET, tmp)
+        assert [e["status"] for e in reloaded.entries] == ["retired", "approved"]
+        assert [e["key"] for e in reloaded.approved_entries()] == ["revenue"]
+        assert reloaded.approved_entries()[0]["text"] == "sum of price and freight"
+        actions = [a["action"] for a in reloaded.audit]
+        assert actions[-2:] == ["note_retired", "note_approved"]
         try:
-            approve_definition("revenue", "sum of price and freight", memory_dir=tmp)
-        except ValueError as exc:
-            assert "already has approved" in str(exc)
-        else:
-            raise AssertionError("expected ValueError for second approval")
-        store = DefinitionStore.load(DEFAULT_DATASET, tmp)
-        store.propose("definition", "revenue", "yet another text")
-        try:
-            store.decide("e2", True)
+            reloaded.propose("definition", "revenue", "yet another text")
+            reloaded.decide("e3", True)
         except ValueError as exc:
             assert "already has approved" in str(exc)
         else:
             raise AssertionError("expected ValueError when approving over an approval")
 
 
-def test_define_creates_approved_entry():
+def test_approve_definition_creates_approved_entry():
     with tempfile.TemporaryDirectory() as tmp:
         entry = approve_definition(
             "revenue", "sum of price", ["q1"], memory_dir=tmp
@@ -189,6 +195,45 @@ def test_audit_only_grows():
         actions = [a["action"] for a in store.audit]
         assert actions == ["note_proposed", "note_approved"]
         assert all("timestamp" in a for a in store.audit)
+
+
+def test_define_command_is_gone(capsys):
+    with tempfile.TemporaryDirectory() as tmp:
+        assert _handle_command("/define revenue = sum of price", tmp) is True
+        assert not (Path(tmp) / f"{DEFAULT_DATASET}.json").exists()
+        assert "unknown command" in capsys.readouterr().out
+
+
+def test_notes_still_lists_approved(capsys):
+    with tempfile.TemporaryDirectory() as tmp:
+        approve_definition("revenue", "sum of price", memory_dir=tmp)
+        assert _handle_command("/notes", tmp) is True
+        out = capsys.readouterr().out
+        assert "revenue" in out and "sum of price" in out
+
+
+def test_forget_retires_entry_and_frees_the_key(capsys):
+    with tempfile.TemporaryDirectory() as tmp:
+        approve_definition("revenue", "sum of price", memory_dir=tmp)
+        assert _handle_command("/forget revenue", tmp) is True
+        assert "retired revenue" in capsys.readouterr().out
+        reloaded = DefinitionStore.load(DEFAULT_DATASET, tmp)
+        assert [e["status"] for e in reloaded.entries] == ["retired"]
+        assert reloaded.build_prompt_section() == ""
+        assert reloaded.approved_entries() == []
+        assert reloaded.audit[-1]["action"] == "note_retired"
+        assert "timestamp" in reloaded.audit[-1]
+        second = approve_definition("revenue", "sum of everything", memory_dir=tmp)
+        assert second["status"] == "approved"
+        assert [e["key"] for e in DefinitionStore.load(
+            DEFAULT_DATASET, tmp).approved_entries()] == ["revenue"]
+
+
+def test_forget_without_approval_errors(capsys):
+    with tempfile.TemporaryDirectory() as tmp:
+        assert _handle_command("/forget revenue", tmp) is True
+        assert "no approved entry" in capsys.readouterr().out
+        assert not (Path(tmp) / f"{DEFAULT_DATASET}.json").exists()
 
 
 def test_entries_are_copies():

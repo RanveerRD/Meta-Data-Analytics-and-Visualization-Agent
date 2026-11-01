@@ -135,17 +135,42 @@ def _record_display_path(path: Path) -> str:
         return str(path)
 
 
-EVIDENCE_QUESTION = "Want the evidence behind these assumptions?"
+EVIDENCE_QUESTION = "Want the evidence behind these decisions?"
 
 
-def render_answer(submission: dict[str, Any]) -> str:
-    """Render the accepted answer with its assumptions and gaps.
+def _render_decision(
+    decision: dict[str, Any], clarifications: list[dict[str, Any]]
+) -> str:
+    """Render one decision with its proof; failed proofs show UNCONFIRMED."""
+    base = f"- {decision['what']}: {decision['choice']}"
+    if decision.get("unconfirmed"):
+        return f"{base} (UNCONFIRMED)"
+    source = decision["source"]
+    if source == "user_stated":
+        return f"{base} (you stated: \"{decision['proof']}\")"
+    if source == "user_chosen":
+        for clarification in clarifications:
+            if clarification["id"] == decision["proof"]:
+                for j, option in enumerate(clarification.get("options", []), 1):
+                    if option.get("label") == clarification.get("reply"):
+                        return f"{base} (you chose: option {j})"
+                return f"{base} (you chose: \"{clarification.get('reply')}\")"
+        return f"{base} (you chose: \"{decision['proof']}\")"
+    return f"{base} (only option in the data)"
+
+
+def render_answer(
+    submission: dict[str, Any], clarifications: list[dict[str, Any]]
+) -> str:
+    """Render the accepted answer with its decisions and gaps.
 
     The Gaps section is always present; with no gaps found it reads
     "- none found".
     """
-    lines = [submission["answer"], "", "Assumptions:"]
-    lines.extend(f"- {a}" for a in submission["assumptions"])
+    lines = [submission["answer"], "", "Decisions:"]
+    lines.extend(
+        _render_decision(d, clarifications) for d in submission["decisions"]
+    )
     lines.append("")
     lines.append("Gaps:")
     gaps = [g for g in submission["gaps"] if g.get("note", "").strip()]
@@ -206,7 +231,7 @@ def _compact_turn_history(
     """Replace this turn's tool traffic with question, summary, and answer.
 
     Raw schema outputs and result rows are dropped; the full detail stays in
-    the record on disk. The rendered answer keeps the assumptions in context
+    the record on disk. The rendered answer keeps the decisions in context
     for follow-up questions.
     """
     del history[snapshot:]
@@ -264,7 +289,9 @@ def _round(
             warning = json.loads(result).get("warning", "")
         except (json.JSONDecodeError, TypeError, AttributeError):
             warning = ""
-        if isinstance(warning, str) and warning.startswith("UNVERIFIED"):
+        if isinstance(warning, str) and warning.startswith(
+            ("UNVERIFIED", "UNCONFIRMED")
+        ):
             print(f"  !! {warning}")
         history.append(
             {
@@ -352,7 +379,7 @@ def answer_question(
     verification: str | None = None
     if ctx.record is not None:
         if submission is not None:
-            text = render_answer(submission)
+            text = render_answer(submission, ctx.record.clarifications)
             verification = (
                 f"verification: {len(submission['matched'])} numbers matched, "
                 f"{len(submission['unmatched'])} unmatched"
