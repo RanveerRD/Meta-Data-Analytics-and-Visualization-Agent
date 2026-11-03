@@ -141,8 +141,8 @@ def test_success_writes_png_and_records(tmp_path):
     ctx, qid = _chart_ctx(tmp_path)
     result = _chart(ctx, qid)
     assert result["ok"] is True
-    assert result["points"] == 3
-    path = Path(result["path"])
+    assert "3 points" in result["description"]
+    path = Path(ctx.record.charts[0]["path"])
     assert path == tmp_path / "charts" / f"{ctx.record.run_id}-1.png"
     assert path.read_bytes()[:4] == b"\x89PNG"
     assert "bar chart of revenue by region, 3 points" in result["description"]
@@ -155,11 +155,12 @@ def test_success_writes_png_and_records(tmp_path):
 
 def test_second_chart_increments_filename(tmp_path):
     ctx, qid = _chart_ctx(tmp_path)
-    first = _chart(ctx, qid)
+    _chart(ctx, qid)
     second = _chart(ctx, qid, chart_type="line", title="Revenue line")
     assert second["ok"] is True
-    assert Path(second["path"]).name == f"{ctx.record.run_id}-2.png"
-    assert first["path"] != second["path"]
+    paths = [c["path"] for c in ctx.record.charts]
+    assert Path(paths[1]).name == f"{ctx.record.run_id}-2.png"
+    assert paths[0] != paths[1]
 
 
 def test_line_chart_ok_and_none_rows_skipped(tmp_path):
@@ -167,8 +168,21 @@ def test_line_chart_ok_and_none_rows_skipped(tmp_path):
     ctx, qid = _chart_ctx(tmp_path, rows=rows)
     result = _chart(ctx, qid, chart_type="line", title="Values")
     assert result["ok"] is True
-    assert result["points"] == 2
+    assert ctx.record.charts[0]["points"] == 2
     assert "skipped" in result["description"]
+
+
+def test_tool_result_hides_path(tmp_path):
+    ctx, qid = _chart_ctx(tmp_path)
+    result = _chart(ctx, qid)
+    assert result["ok"] is True
+    assert "path" not in result
+    assert ".png" not in json.dumps(result)
+    assert ctx.record.run_id not in json.dumps(result)
+    assert result["guidance"] == (
+        "The chart file is shown to the user by the console; "
+        "do not mention its path or file name in the answer."
+    )
 
 
 def test_tool_in_registry_and_schema_lint(tmp_path):

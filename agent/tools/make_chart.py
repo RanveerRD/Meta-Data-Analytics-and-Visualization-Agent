@@ -574,6 +574,7 @@ def run(ctx: Any, args: dict[str, Any]) -> str:
         + (f" ({skipped} empty rows skipped)" if skipped else "")
     )
     return json.dumps(
-        {"ok": True, "path": entry["path"], "description": description,
-         "points": len(points), "chart_id": entry["id"]}
+        {"ok": True, "description": description, "note": entry["note"],
+         "guidance": "The chart file is shown to the user by the console; "
+                     "do not mention its path or file name in the answer."}
     )

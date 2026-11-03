@@ -135,8 +135,8 @@ def _summarize(name: str, result: str) -> str:
     if data.get("ok"):
         status = f" ({data['status']})" if "status" in data else ""
         return f"{name}: ok{status}"
-    if "path" in data and "points" in data:
-        return f"{name}: {data['points']} points -> {data['path']}"
+    if name == "make_chart" and "description" in data:
+        return f"make_chart: {data['description']}"
     return str(result)[:100]
 
 
