@@ -94,6 +94,13 @@ def _handle_command(
     return True
 
 
+def _print_new_charts(text: str, charts: list[str]) -> None:
+    """Announce charts not already listed under the answer (e.g. /chart)."""
+    for path in charts:
+        if path not in text:
+            print(f"chart saved: {path}")
+
+
 def _format_evidence(value: object) -> str:
     """Format one evidence value; numbers get thousands separators."""
     if isinstance(value, bool):
@@ -370,8 +377,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         if result.text:
             print(result.text)
-        for path in result.charts:
-            print(f"chart saved: {path}")
+        _print_new_charts(result.text, result.charts)
         if result.usage_known:
             print(
                 f"tokens: {result.input_tokens} in / "

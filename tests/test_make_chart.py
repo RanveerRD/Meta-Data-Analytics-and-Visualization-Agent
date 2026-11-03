@@ -7,11 +7,20 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import matplotlib.pyplot as plt
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from agent.loop import render_answer  # noqa: E402
 from agent.record import AnalysisRecord  # noqa: E402
 from agent.tools import TOOL_SCHEMAS, ToolContext, dispatch, schemas_for  # noqa: E402
+from agent.tools.make_chart import (  # noqa: E402
+    REPO_ROOT,
+    _MAX_WIDTH,
+    _display_path,
+    _render_figure,
+)
 
 ROWS = [["SP", 498440.43], ["RJ", 12.345], ["MG", 100.0]]
 
@@ -175,6 +184,72 @@ def test_tool_in_registry_and_schema_lint(tmp_path):
     assert all(s["name"] != "make_chart" for s in schemas_for(ctx))
     refused = json.loads(dispatch(ctx, "make_chart", {}))
     assert "cross-dataset" in refused["error"]
+
+
+def _assert_inside(fig, box):
+    fb = fig.bbox
+    assert box.x0 >= fb.x0 - 1
+    assert box.y0 >= fb.y0 - 1
+    assert box.x1 <= fb.x1 + 1
+    assert box.y1 <= fb.y1 + 1
+
+
+@pytest.mark.parametrize("chart_type", ["bar", "line"])
+@pytest.mark.parametrize("n", [2, 10, 25, 50])
+@pytest.mark.parametrize("style", ["short", "long"])
+def test_tick_labels_never_overlap_or_clip(chart_type, n, style):
+    if style == "short":
+        raw = [f"2017-{i + 1:02d}" for i in range(n)]
+    else:
+        raw = [f"health_beauty_and_personal_care_{i}" for i in range(n)]
+    values = [float((i * 37) % 91 + 5) for i in range(n)]
+    fig, ax = _render_figure(raw, values, chart_type, "Title here", "xcol", "ycol")
+    try:
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        positions = list(ax.get_xticks())
+        assert positions[0] == 0 and positions[-1] == n - 1
+        ticks = [t for t in ax.get_xticklabels() if t.get_visible()]
+        assert len(ticks) >= 2
+        boxes = [t.get_window_extent(renderer) for t in ticks]
+        for box in boxes:
+            _assert_inside(fig, box)
+        for i, first in enumerate(boxes):
+            for second in boxes[i + 1:]:
+                assert not first.padded(1).overlaps(second.padded(1))
+        for artist in (ax.title, ax.xaxis.label, ax.yaxis.label):
+            _assert_inside(fig, artist.get_window_extent(renderer))
+        shown = [t for t in ax.texts if t.get_visible()]
+        shown_boxes = [t.get_window_extent(renderer) for t in shown]
+        for box in shown_boxes:
+            _assert_inside(fig, box)
+        for i, first in enumerate(shown_boxes):
+            for second in shown_boxes[i + 1:]:
+                assert not first.padded(1).overlaps(second.padded(1))
+        assert fig.get_size_inches()[0] <= _MAX_WIDTH + 1e-9
+    finally:
+        plt.close(fig)
+
+
+def test_figure_width_grows_then_caps():
+    raw2 = ["a", "b"]
+    raw50 = [f"health_beauty_and_personal_care_{i}" for i in range(50)]
+    fig2, _ = _render_figure(raw2, [1.0, 2.0], "bar", "T", "x", "y")
+    fig50, _ = _render_figure(raw50, [float(i) for i in range(50)], "bar", "T", "x", "y")
+    try:
+        assert fig50.get_size_inches()[0] > fig2.get_size_inches()[0]
+        assert fig50.get_size_inches()[0] <= _MAX_WIDTH + 1e-9
+    finally:
+        plt.close(fig2)
+        plt.close(fig50)
+
+
+def test_display_path_relative_under_root():
+    assert (
+        _display_path(REPO_ROOT / "workspace" / "charts" / "x-1.png")
+        == "workspace/charts/x-1.png"
+    )
+    assert _display_path("/tmp/other/y.png") == "/tmp/other/y.png"
 
 
 def test_render_chart_line_never_verified():

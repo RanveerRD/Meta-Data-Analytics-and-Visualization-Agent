@@ -389,6 +389,18 @@ def test_merge_prompt_answers_briefly():
     assert "only numbers that appear in those texts" in MERGE_SYSTEM
 
 
+def test_print_new_charts_skips_announced(capsys):
+    from agent.__main__ import _print_new_charts
+
+    _print_new_charts(
+        "answer\nChart: workspace/charts/a-1.png",
+        ["workspace/charts/a-1.png", "workspace/charts/b-2.png"],
+    )
+    out = capsys.readouterr().out
+    assert "chart saved: workspace/charts/a-1.png" not in out
+    assert "chart saved: workspace/charts/b-2.png" in out
+
+
 def test_help_lists_commands(capsys):
     from agent.__main__ import _handle_command
 

@@ -65,6 +65,19 @@ SCHEMA: dict[str, Any] = {
 
 _MAX_POINTS = 50
 _MIN_POINTS = 2
+_MAX_WIDTH = 16.0
+_ROTS = [0, 45, 90]
+_EPS_PX = 1.0
+
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+
+
+def _display_path(path: str | Path) -> str:
+    """Path relative to the project root, like the Record line."""
+    try:
+        return str(Path(path).relative_to(REPO_ROOT))
+    except ValueError:
+        return str(path)
 
 
 def _refuse(reason: str) -> str:
@@ -94,6 +107,130 @@ def _check_title(title: str, cells: list[Any], points: int) -> str | None:
             "and an integer equal to the point count is allowed)."
         )
     return None
+
+
+def _base_width(n: int) -> float:
+    return min(max(6.4, 0.45 * n), _MAX_WIDTH)
+
+
+def _apply_ticks(ax: Any, labels: list[str], rot: int, step: int) -> None:
+    """Show every step-th label, always keeping the first and the last."""
+    n = len(labels)
+    idx = sorted(set(range(0, n, step)) | ({n - 1} if n else set()))
+    ax.set_xticks(list(idx), [labels[i] for i in idx])
+    for text in ax.get_xticklabels():
+        text.set_rotation(rot)
+        text.set_ha("right" if rot else "center")
+
+
+def _boxes_overlap(a: Any, b: Any) -> bool:
+    return a.padded(_EPS_PX).overlaps(b.padded(_EPS_PX))
+
+
+def _inside(fig: Any, box: Any) -> bool:
+    fb = fig.bbox
+    return (
+        box.x0 >= fb.x0 - _EPS_PX
+        and box.y0 >= fb.y0 - _EPS_PX
+        and box.x1 <= fb.x1 + _EPS_PX
+        and box.y1 <= fb.y1 + _EPS_PX
+    )
+
+
+def _ticks_clean(fig: Any, ax: Any) -> bool:
+    fig.tight_layout()
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    boxes = [
+        t.get_window_extent(renderer)
+        for t in ax.get_xticklabels()
+        if t.get_visible()
+    ]
+    if not boxes:
+        return False
+    if any(not _inside(fig, box) for box in boxes):
+        return False
+    return not any(
+        _boxes_overlap(a, b)
+        for i, a in enumerate(boxes)
+        for b in boxes[i + 1:]
+    )
+
+
+def _ladder(chart_type: str, n: int) -> list[tuple[int, float, int]]:
+    """Deterministic escalation: rotation, then widening or thinning.
+
+    Bar charts widen up to the cap before thinning (a hidden tick hides
+    which bar a label belongs to, so thinning is the last resort); line
+    charts thin before widening. The first and last labels always stay.
+    """
+    base = _base_width(n)
+    widths = sorted({base, min(base * 1.6, _MAX_WIDTH), _MAX_WIDTH})
+    thin = list(range(2, n + 1))
+    if chart_type == "bar":
+        combos = [(r, w, 1) for r in _ROTS for w in widths]
+        combos += [(90, _MAX_WIDTH, s) for s in thin]
+    else:
+        combos = [(r, base, 1) for r in _ROTS]
+        combos += [(90, base, s) for s in thin]
+        combos += [(90, w, 1) for w in widths[1:]]
+        combos += [(90, _MAX_WIDTH, s) for s in thin]
+    return combos
+
+
+def _drop_overlapping_bar_values(fig: Any, ax: Any) -> None:
+    """Remove bar value labels if any overlap or leave the figure."""
+    texts = [t for t in ax.texts if t.get_visible()]
+    if not texts:
+        return
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    boxes = [t.get_window_extent(renderer) for t in texts]
+    bad = any(not _inside(fig, box) for box in boxes) or any(
+        _boxes_overlap(a, b)
+        for i, a in enumerate(boxes)
+        for b in boxes[i + 1:]
+    )
+    if bad:
+        for text in texts:
+            text.remove()
+
+
+def _render_figure(
+    raw_labels: list[str],
+    values: list[float],
+    chart_type: str,
+    title: str,
+    x_column: str,
+    y_column: str,
+) -> tuple[Any, Any]:
+    """Draw the chart with the first non-overlapping label layout.
+
+    Returns (fig, ax); the caller saves and closes. Deterministic: the
+    same inputs always walk the same ladder and stop at the same layout.
+    """
+    labels = [textwrap.fill(label, 15) for label in raw_labels]
+    n = len(labels)
+    fig, ax = plt.subplots(figsize=(_base_width(n), 4.8))
+    if chart_type == "bar":
+        ax.bar(range(n), values)
+        ax.set_ylim(bottom=0)
+        ax.bar_label(ax.containers[0], fmt=lambda v: f"{v:,.2f}", padding=2, fontsize=8)
+    else:
+        ax.plot(range(n), values, marker="o")
+    ax.set_xlabel(x_column)
+    ax.set_ylabel(y_column)
+    ax.set_title(title)
+    for rot, width, step in _ladder(chart_type, n):
+        fig.set_size_inches(width, 4.8)
+        _apply_ticks(ax, labels, rot, step)
+        if _ticks_clean(fig, ax):
+            break
+    if chart_type == "bar":
+        _drop_overlapping_bar_values(fig, ax)
+    fig.tight_layout()
+    fig.canvas.draw()
+    return fig, ax
 
 
 def run(ctx: Any, args: dict[str, Any]) -> str:
@@ -162,30 +299,19 @@ def run(ctx: Any, args: dict[str, Any]) -> str:
     number = len(record.charts) + 1
     out = charts_dir / f"{record.run_id}-{number}.png"
 
-    labels = [textwrap.fill(label, 15) for label, _ in points]
+    raw_labels = [label for label, _ in points]
     values = [value for _, value in points]
     try:
-        _fig, ax = plt.subplots()
-        if chart_type == "bar":
-            ax.bar(labels, values)
-            ax.set_ylim(bottom=0)
-            ax.bar_label(
-                ax.containers[0], fmt=lambda v: f"{v:,.2f}", padding=2, fontsize=8
-            )
-        else:
-            ax.plot(labels, values, marker="o")
-        if max(len(label) for label in labels) > 10:
-            plt.xticks(rotation=30, ha="right")
-        ax.set_xlabel(args["x_column"])
-        ax.set_ylabel(args["y_column"])
-        ax.set_title(args["title"])
-        plt.tight_layout()
-        plt.savefig(out, dpi=150)
+        fig, ax = _render_figure(
+            raw_labels, values, chart_type,
+            args["title"], args["x_column"], args["y_column"],
+        )
+        fig.savefig(out, dpi=150)
     finally:
         plt.close("all")
     entry = record.record_chart(
         query_id, chart_type, args["x_column"], args["y_column"],
-        args["title"], str(out), len(points), skipped,
+        args["title"], _display_path(out), len(points), skipped,
     )
     description = (
         f"{chart_type} chart of {args['y_column']} by {args['x_column']}, "
