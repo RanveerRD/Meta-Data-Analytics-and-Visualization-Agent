@@ -2,14 +2,32 @@
 
 from __future__ import annotations
 
+import argparse
+from functools import partial
+
 from agent.backend import SqliteBackend
 from agent.loop import REPO_ROOT, answer_question, build_client
+from agent.pg_backend import PostgresBackend
 from agent.preliminary_analysis import (
     DEFAULT_DATASET,
     MEMORY_DIR,
     DefinitionStore,
     approve_definition,
 )
+
+DATASETS = ("olist", "adventureworks")
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse console flags; --dataset picks the database and memory store."""
+    parser = argparse.ArgumentParser(description="Ask questions about a dataset.")
+    parser.add_argument(
+        "--dataset",
+        choices=DATASETS,
+        default="olist",
+        help="which dataset to query (default: olist)",
+    )
+    return parser.parse_args(argv)
 
 
 def _base_instructions(dialect: str) -> str:
@@ -20,20 +38,27 @@ def _base_instructions(dialect: str) -> str:
     return text.replace("{dialect}", dialect)
 
 
-def _instructions_for_question(base: str) -> str:
-    """Base instructions plus this question's approved definitions."""
-    section = DefinitionStore.load(DEFAULT_DATASET).build_prompt_section()
+def _instructions_for_question(
+    base: str, dataset: str = DEFAULT_DATASET, dialect_notes: str = ""
+) -> str:
+    """Base instructions plus dialect notes and this question's definitions."""
+    instructions = base
+    if dialect_notes:
+        instructions += "\n\nDialect notes:\n" + dialect_notes
+    section = DefinitionStore.load(dataset).build_prompt_section()
     if not section:
-        return base
-    return base + "\n\n" + section
+        return instructions
+    return instructions + "\n\n" + section
 
 
-def _handle_command(line: str, memory_dir=MEMORY_DIR) -> bool:
+def _handle_command(
+    line: str, memory_dir=MEMORY_DIR, dataset: str = DEFAULT_DATASET
+) -> bool:
     """Run a / command. Returns True when the line was a command."""
     if not line.startswith("/"):
         return False
     if line == "/notes":
-        approved = DefinitionStore.load(DEFAULT_DATASET, memory_dir).approved_entries()
+        approved = DefinitionStore.load(dataset, memory_dir).approved_entries()
         if not approved:
             print("no approved notes yet")
         for entry in approved:
@@ -42,7 +67,7 @@ def _handle_command(line: str, memory_dir=MEMORY_DIR) -> bool:
     if line.startswith("/forget "):
         key = line[len("/forget "):].strip()
         try:
-            store = DefinitionStore.load(DEFAULT_DATASET, memory_dir)
+            store = DefinitionStore.load(dataset, memory_dir)
             entry = store.retire(key)
         except ValueError as exc:
             print(f"error: {exc}")
@@ -152,9 +177,9 @@ def _offer_definition_save(
         return True
 
 
-def _review_proposed_notes() -> None:
+def _review_proposed_notes(dataset: str = DEFAULT_DATASET) -> None:
     """Ask the user to approve or reject each proposed note."""
-    store = DefinitionStore.load(DEFAULT_DATASET)
+    store = DefinitionStore.load(dataset)
     for entry in store.entries:
         if entry["status"] != "proposed":
             continue
@@ -174,33 +199,60 @@ def _review_proposed_notes() -> None:
             print(f"rejected {entry['key']}")
 
 
-def main() -> int:
+def _backend_for_dataset(dataset: str):
+    """Connect to the chosen dataset; fail fast with a clear error."""
+    if dataset == "adventureworks":
+        return PostgresBackend()
+    return SqliteBackend(REPO_ROOT / "data" / "olist.sqlite")
+
+
+_BANNERS = {
+    "olist": ("Ask about the Olist database. Empty line exits.", "olist> "),
+    "adventureworks": (
+        "Ask about the AdventureWorks database. Empty line exits.",
+        "adventureworks> ",
+    ),
+}
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    dataset = args.dataset
     try:
         client, model = build_client()
     except RuntimeError as exc:
         print(f"error: {exc}")
         return 2
-    backend = SqliteBackend(REPO_ROOT / "data" / "olist.sqlite")
+    try:
+        backend = _backend_for_dataset(dataset)
+    except RuntimeError as exc:
+        print(f"error: {exc}")
+        return 2
     try:
         base_instructions = _base_instructions(backend.dialect)
     except RuntimeError as exc:
         print(f"error: {exc}")
         return 2
+    banner, prompt_label = _BANNERS[dataset]
+    save = partial(approve_definition, dataset=dataset)
     history: list = []
-    print("Ask about the Olist database. Empty line exits.")
+    print(banner)
     while True:
         try:
-            question = input("olist> ")
+            question = input(prompt_label)
         except EOFError:
             break
         if not question.strip():
             break
-        if _handle_command(question.strip()):
+        if _handle_command(question.strip(), dataset=dataset):
             continue
-        instructions = _instructions_for_question(base_instructions)
+        instructions = _instructions_for_question(
+            base_instructions, dataset, backend.dialect_notes
+        )
         result = answer_question(
             client, model, instructions, backend, history, question,
             ask_user=_console_ask_user,
+            dataset=dataset,
         )
         if result.text:
             print(result.text)
@@ -215,8 +267,8 @@ def main() -> int:
             print(f"Record: {result.record_path}")
         if result.verification:
             print(result.verification)
-        _offer_definition_save(result.clarification)
-        _review_proposed_notes()
+        _offer_definition_save(result.clarification, approve=save)
+        _review_proposed_notes(dataset)
     backend.close()
     return 0
 

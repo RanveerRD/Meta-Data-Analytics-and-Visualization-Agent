@@ -96,6 +96,7 @@ _MISSING_RECORD_ERROR = "submit_answer is refused: call set_checklist first."
 _MAX_REJECTIONS = 3
 
 _WORD_RE = re.compile(r"[a-z0-9]+")
+_LISTING_RE = re.compile(r"\bgroup\s+by\b|\bdistinct\b", re.IGNORECASE)
 
 _IGNORED_KEY_TOKENS = frozenset({"only", "the", "and", "for"})
 
@@ -243,12 +244,22 @@ def _validate_decisions(
         elif proof.strip() not in known_queries:
             problem = f"unknown query {proof.strip()!r}"
         else:
-            covering = _covering_clarification(record, what.strip())
-            if covering is not None:
+            cited = next(
+                q for q in record.queries if q["id"] == proof.strip()
+            )
+            if not _LISTING_RE.search(cited.get("sql", "")) or len(cited.get("rows", [])) != 1:
                 problem = (
-                    f"covered by clarification {covering}; cite it as user_chosen "
-                    "instead of only_option"
+                    "only_option needs a query that lists the possible values "
+                    "and shows exactly one; ask via ask_clarification or cite "
+                    "the user's words"
                 )
+            else:
+                covering = _covering_clarification(record, what.strip())
+                if covering is not None:
+                    problem = (
+                        f"covered by clarification {covering}; cite it as user_chosen "
+                        "instead of only_option"
+                    )
         normalized.append(
             {
                 "what": what.strip(),

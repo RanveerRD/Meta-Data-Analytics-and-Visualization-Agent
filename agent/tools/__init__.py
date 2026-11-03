@@ -32,6 +32,7 @@ class ToolContext:
     record: AnalysisRecord | None = None
     memory_dir: Path | None = None
     ask_user: Any = None
+    dataset: str = "olist"
 
 
 def _tool_modules() -> tuple:

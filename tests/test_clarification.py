@@ -469,9 +469,13 @@ def test_instructions_require_asking_every_time():
     assert "EVERY time, even if a saved definition exists" in text
     assert "top_metric" in text
     assert "after the last clarification is answered" in text.lower()
-    for key in ("revenue", "top_metric", "order_status", "year_date"):
+    for key in ("revenue", "top_metric", "order_status", "year_date", "cost", "period"):
         assert key in text
-    assert "one column, one distinct value" in text
+    assert "more than one candidate column, table or definition" in text
+    assert "counts as stating it" in text
+    assert "only_option is only for a list of distinct values" in text
+    assert "FIRST, before computing any figure" in text
+    assert "Never compute combinations of candidates" in text
 
 
 def test_loop_continues_same_turn_after_reply():

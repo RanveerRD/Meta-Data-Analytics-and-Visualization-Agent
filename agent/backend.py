@@ -25,6 +25,11 @@ class DatabaseBackend(Protocol):
         """Short dialect name, e.g. "SQLite". Inserted into the system prompt."""
         ...
 
+    @property
+    def dialect_notes(self) -> str:
+        """A few lines of dialect guidance, inserted under "Dialect notes:"."""
+        ...
+
     def list_tables(self) -> list[str]:
         """Names of queryable tables and views, sorted."""
         ...
@@ -97,6 +102,13 @@ class SqliteBackend:
     @property
     def dialect(self) -> str:
         return "SQLite"
+
+    @property
+    def dialect_notes(self) -> str:
+        return (
+            "Dates are text like 'YYYY-MM-DD HH:MM:SS'; "
+            "use strftime('%Y-%m', col) for parts."
+        )
 
     def list_tables(self) -> list[str]:
         rows = self._conn.execute(

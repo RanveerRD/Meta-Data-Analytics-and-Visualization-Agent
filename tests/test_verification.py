@@ -19,7 +19,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from agent.backend import SqliteBackend  # noqa: E402
-from agent.loop import WRAP_UP_NUDGE, answer_question, render_answer  # noqa: E402
+from agent.loop import (  # noqa: E402
+    MAX_TURNS,
+    WRAP_UP_NUDGE,
+    answer_question,
+    render_answer,
+)
 from agent.numbers import extract_numbers, verify_text  # noqa: E402
 from agent.tools import TOOL_SCHEMAS, ToolContext, dispatch  # noqa: E402
 
@@ -34,7 +39,11 @@ PLAN = [
 ]
 
 DECISIONS = [
-    {"what": "scope", "choice": "all rows", "source": "only_option", "proof": "q1"}
+    {"what": "scope", "choice": "all rows", "source": "only_option", "proof": "q2"}
+]
+
+LOOP_DECISIONS = [
+    {"what": "scope", "choice": "everything", "source": "user_stated", "proof": "How many?"}
 ]
 
 
@@ -58,7 +67,7 @@ def _ctx(backend: SqliteBackend, tmp: str, question: str = "q?") -> ToolContext:
 
 
 def _flowed_ctx(backend: SqliteBackend, tmp: str) -> ToolContext:
-    """Context with checklist, plan, and one recorded query (q1)."""
+    """Context with checklist, plan, q1 (two regions) and q2 (one region)."""
     ctx = _ctx(backend, tmp)
     assert json.loads(dispatch(ctx, "set_checklist", {"items": ITEMS}))["ok"] is True
     assert json.loads(dispatch(ctx, "plan_action", {"plan": PLAN}))["ok"] is True
@@ -66,6 +75,10 @@ def _flowed_ctx(backend: SqliteBackend, tmp: str) -> ToolContext:
         dispatch(ctx, "run_sql", {"query": "SELECT region, revenue FROM sales ORDER BY region;"})
     )
     assert result["query_id"] == "q1"
+    result = json.loads(
+        dispatch(ctx, "run_sql", {"query": "SELECT DISTINCT region FROM sales WHERE region = 'RJ';"})
+    )
+    assert result["query_id"] == "q2"
     return ctx
 
 
@@ -152,7 +165,7 @@ def test_repeat_set_checklist_keeps_queries_drops_stale_findings():
             )
             assert ctx.record.is_proven("top_region")
             dispatch(ctx, "set_checklist", {"items": [ITEMS[0]]})
-            assert [q["id"] for q in ctx.record.queries] == ["q1"]
+            assert [q["id"] for q in ctx.record.queries] == ["q1", "q2"]
             assert ctx.record.findings == []
             assert ctx.record.plan == []
             assert [c["id"] for c in ctx.record.checklist] == ["total_revenue"]
@@ -423,6 +436,10 @@ def _decided_ctx(backend: SqliteBackend, tmp: str) -> ToolContext:
         dispatch(ctx, "run_sql", {"query": "SELECT region, revenue FROM sales ORDER BY region;"})
     )
     assert result["query_id"] == "q1"
+    result = json.loads(
+        dispatch(ctx, "run_sql", {"query": "SELECT DISTINCT region FROM sales WHERE region = 'RJ';"})
+    )
+    assert result["query_id"] == "q2"
     for item_id, value in (("total_revenue", 498440.43), ("top_region", "RJ")):
         dispatch(
             ctx,
@@ -458,12 +475,12 @@ def test_decisions_each_source_accepted():
                 {"what": "status scope", "choice": "delivered",
                  "source": "user_chosen", "proof": "c1"},
                 {"what": "date range", "choice": "all years",
-                 "source": "only_option", "proof": "q1"},
+                 "source": "only_option", "proof": "q2"},
             ])
             assert result["ok"] is True
             assert result["status"] == "answered"
             stored = ctx.record.submission["decisions"]
-            assert [d["proof"] for d in stored] == ["c1", "delivered orders", "q1"]
+            assert [d["proof"] for d in stored] == ["c1", "delivered orders", "q2"]
             assert stored[0]["source"] == "user_chosen"
             assert stored[0]["choice"] == "delivered only"
         finally:
@@ -482,8 +499,8 @@ def test_only_option_accepted_without_clarification():
                     {"item_id": item_id, "claim": "c", "query_id": "q1", "value": value},
                 )
             result = _submit(ctx, [
-                {"what": "metric", "choice": "revenue",
-                 "source": "only_option", "proof": "q1"},
+                {"what": "metric", "choice": "RJ",
+                 "source": "only_option", "proof": "q2"},
             ])
             assert result["ok"] is True
         finally:
@@ -499,7 +516,7 @@ def test_only_option_refused_when_clarified():
                 {"what": "status scope", "choice": "delivered orders",
                  "source": "user_stated", "proof": "delivered orders"},
                 {"what": "revenue definition", "choice": "delivered only",
-                 "source": "only_option", "proof": "q1"},
+                 "source": "only_option", "proof": "q2"},
             ])
             assert "covered by clarification c1" in result["error"]
             assert "user_chosen" in result["error"]
@@ -538,7 +555,7 @@ def test_only_option_matches_definition_key_only():
             ):
                 result = _submit(ctx, [
                     {"what": what, "choice": "order_purchase_timestamp",
-                     "source": "only_option", "proof": "q1"},
+                     "source": "only_option", "proof": "q2"},
                 ])
                 assert result["ok"] is True, what
             for key, what, choice in (
@@ -550,9 +567,39 @@ def test_only_option_matches_definition_key_only():
                 fresh.record.store_clarification("Which?", [], choice, key)
                 refused = _submit(fresh, [
                     {"what": what, "choice": choice,
-                     "source": "only_option", "proof": "q1"},
+                     "source": "only_option", "proof": "q2"},
                 ])
                 assert "covered by clarification c1" in refused["error"], what
+        finally:
+            backend.close()
+
+
+def test_only_option_needs_listing_query():
+    with tempfile.TemporaryDirectory() as tmp:
+        backend = _make_backend(tmp)
+        try:
+            ctx = _proven_ctx(backend, tmp)
+            agg = json.loads(dispatch(ctx, "run_sql", {"query": "SELECT SUM(revenue) FROM sales;"}))
+            assert agg["query_id"] == "q3"
+            refused = _submit(ctx, [
+                {"what": "total", "choice": "sum",
+                 "source": "only_option", "proof": "q3"},
+            ])
+            assert "lists the possible values" in refused["error"]
+            grouped = json.loads(dispatch(ctx, "run_sql", {"query": "SELECT region, SUM(revenue) FROM sales GROUP BY region;"}))
+            assert grouped["query_id"] == "q4"
+            refused = _submit(ctx, [
+                {"what": "region", "choice": "RJ",
+                 "source": "only_option", "proof": "q4"},
+            ])
+            assert "shows exactly one" in refused["error"]
+            single = json.loads(dispatch(ctx, "run_sql", {"query": "SELECT region, SUM(revenue) FROM sales WHERE region = 'RJ' GROUP BY region;"}))
+            assert single["query_id"] == "q5"
+            ok = _submit(ctx, [
+                {"what": "region", "choice": "RJ",
+                 "source": "only_option", "proof": "q5"},
+            ])
+            assert ok["ok"] is True
         finally:
             backend.close()
 
@@ -581,7 +628,7 @@ def test_keyless_clarifications_never_block_only_option():
             })
             result = _submit(ctx, [
                 {"what": "delivered scope", "choice": "delivered",
-                 "source": "only_option", "proof": "q1"},
+                 "source": "only_option", "proof": "q2"},
             ])
             assert result["ok"] is True
         finally:
@@ -687,7 +734,7 @@ def test_escalation_marks_unconfirmed_decisions():
                 {"what": "status scope", "choice": "x",
                  "source": "user_stated", "proof": "xyz"},
                 {"what": "date range", "choice": "all years",
-                 "source": "only_option", "proof": "q1"},
+                 "source": "only_option", "proof": "q2"},
             ]
             last = {}
             for _ in range(3):
@@ -844,7 +891,7 @@ def test_loop_shows_accepted_submit_text():
                     "item_id": "n", "claim": "3 items", "query_id": "q1", "value": 3})),
                 _response(_call("c5", "submit_answer", {
                     "answer": "There are 3 items.",
-                    "decisions": DECISIONS,
+                    "decisions": LOOP_DECISIONS,
                     "gaps": []})),
                 _response(_message("WRONG TEXT")),
             ]
@@ -854,7 +901,7 @@ def test_loop_shows_accepted_submit_text():
                 runs_dir=Path(tmp) / "runs",
             )
             expected = (
-                "There are 3 items.\n\nDecisions:\n- scope: all rows (not asked: no alternative found, query q1)\n\n"
+                "There are 3 items.\n\nDecisions:\n- scope: everything (you stated: \"How many?\")\n\n"
                 "Gaps:\n- none found\n\n"
                 "Want the evidence behind these decisions?"
             )
@@ -886,7 +933,7 @@ def test_loop_reminds_when_plain_text_without_submit():
                     "item_id": "n", "claim": "3 items", "query_id": "q1", "value": 3})),
                 _response(_call("c5", "submit_answer", {
                     "answer": "There are 3 items.",
-                    "decisions": DECISIONS,
+                    "decisions": LOOP_DECISIONS,
                     "gaps": []})),
                 _response(_message("done")),
             ]
@@ -896,7 +943,7 @@ def test_loop_reminds_when_plain_text_without_submit():
                 runs_dir=Path(tmp) / "runs",
             )
             expected = (
-                "There are 3 items.\n\nDecisions:\n- scope: all rows (not asked: no alternative found, query q1)\n\n"
+                "There are 3 items.\n\nDecisions:\n- scope: everything (you stated: \"How many?\")\n\n"
                 "Gaps:\n- none found\n\n"
                 "Want the evidence behind these decisions?"
             )
@@ -944,32 +991,32 @@ def test_acceptance_on_final_round_returns_answer_not_cap():
                     _call("c2", "plan_action", {"plan": [
                         {"item_id": "n", "steps": ["count"]}]})),
             ]
-            for i in range(1, 14):
+            for i in range(1, 28):
                 script.append(_response(_call(f"g{i}", "get_schema", {"table": "items"})))
             script += [
                 _response(
-                    _call("c15a", "run_sql", {"query": "SELECT count(*) FROM items;"}),
-                    _call("c15b", "record_finding", {
+                    _call("c29a", "run_sql", {"query": "SELECT count(*) FROM items;"}),
+                    _call("c29b", "record_finding", {
                         "item_id": "n", "claim": "3 items", "query_id": "q1", "value": 3}),
                 ),
-                _response(_call("c16", "submit_answer", {
+                _response(_call("c30", "submit_answer", {
                     "answer": "There are 3 items.",
-                    "decisions": DECISIONS,
+                    "decisions": LOOP_DECISIONS,
                     "gaps": []})),
             ]
-            assert len(script) == 16
+            assert len(script) == MAX_TURNS
             client = _StubClient(script)
             result = answer_question(
                 client, "m", "instr", backend, [], "How many?",
                 runs_dir=Path(tmp) / "runs",
             )
             assert result.text == (
-                "There are 3 items.\n\nDecisions:\n- scope: all rows (not asked: no alternative found, query q1)\n\n"
+                "There are 3 items.\n\nDecisions:\n- scope: everything (you stated: \"How many?\")\n\n"
                 "Gaps:\n- none found\n\n"
                 "Want the evidence behind these decisions?"
             )
             assert "Reached the" not in result.text
-            assert client.calls == 16
+            assert client.calls == MAX_TURNS
             assert result.verification == "verification: 1 numbers matched, 0 unmatched"
         finally:
             backend.close()
@@ -985,7 +1032,7 @@ def test_no_calls_after_early_acceptance():
                 _response(_call("c3", "get_schema", {"table": "items"})),
                 _response(_call("c4", "run_sql", {"query": "SELECT count(*) FROM items;"})),
                 _response(_call("c5", "record_finding", {"item_id": "n", "claim": "3 items", "query_id": "q1", "value": 3})),
-                _response(_call("c6", "submit_answer", {"answer": "There are 3 items.", "decisions": DECISIONS, "gaps": []})),
+                _response(_call("c6", "submit_answer", {"answer": "There are 3 items.", "decisions": LOOP_DECISIONS, "gaps": []})),
             ]
             assert len(script) == 6
             client = _StubClient(script)
@@ -994,7 +1041,7 @@ def test_no_calls_after_early_acceptance():
                 runs_dir=Path(tmp) / "runs",
             )
             assert result.text == (
-                "There are 3 items.\n\nDecisions:\n- scope: all rows (not asked: no alternative found, query q1)\n\n"
+                "There are 3 items.\n\nDecisions:\n- scope: everything (you stated: \"How many?\")\n\n"
                 "Gaps:\n- none found\n\n"
                 "Want the evidence behind these decisions?"
             )
@@ -1003,10 +1050,10 @@ def test_no_calls_after_early_acceptance():
             backend.close()
 
 
-def _accepted_answer_script(prefix: str):
+def _accepted_answer_script(prefix: str, question: str = "How many?"):
     return [
         _response(_call(prefix + "1", "set_checklist", {"items": [
-            {"id": "n", "question": "How many?", "evidence_needed": "count"}]})),
+            {"id": "n", "question": question, "evidence_needed": "count"}]})),
         _response(_call(prefix + "2", "plan_action", {"plan": [
             {"item_id": "n", "steps": ["count"]}]})),
         _response(_call(prefix + "3", "run_sql", {"query": "SELECT count(*) FROM items;"})),
@@ -1014,7 +1061,10 @@ def _accepted_answer_script(prefix: str):
             "item_id": "n", "claim": "3 items", "query_id": "q1", "value": 3})),
         _response(_call(prefix + "5", "submit_answer", {
             "answer": "There are 3 items.",
-            "decisions": DECISIONS,
+            "decisions": [
+                {"what": "scope", "choice": "everything",
+                 "source": "user_stated", "proof": question},
+            ],
             "gaps": []})),
     ]
 
@@ -1050,9 +1100,9 @@ def test_history_stays_small_across_questions():
         backend = _stub_backend(tmp)
         try:
             script = (
-                _accepted_answer_script("a")
-                + _accepted_answer_script("b")
-                + _accepted_answer_script("c")
+                _accepted_answer_script("a", "First?")
+                + _accepted_answer_script("b", "Second?")
+                + _accepted_answer_script("c", "Third?")
             )
             client = _StubClient(script)
             history: list = []
@@ -1169,10 +1219,10 @@ def test_cap_shows_partial_summary():
                 _StubClient(script), "m", "instr", backend, [], "How many?",
                 runs_dir=Path(tmp) / "runs",
             )
-            assert "Reached the 20-turn limit" in result.text
+            assert f"Reached the {MAX_TURNS}-turn limit" in result.text
             assert "- n: proven" in result.text
             assert "- 3 items (3)" in result.text
-            assert "Queries run: 17" in result.text
+            assert f"Queries run: {MAX_TURNS - 3}" in result.text
             assert "Record: " in result.text
             assert result.verification == "verification: no submitted answer"
         finally:

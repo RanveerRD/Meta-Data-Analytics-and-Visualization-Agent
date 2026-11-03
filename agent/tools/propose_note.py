@@ -10,7 +10,6 @@ import json
 from typing import TYPE_CHECKING, Any
 
 from agent.preliminary_analysis import (
-    DEFAULT_DATASET,
     MEMORY_DIR,
     DefinitionStore,
 )
@@ -58,7 +57,7 @@ SCHEMA: dict[str, Any] = {
 
 def run(ctx: ToolContext, args: dict[str, Any]) -> str:
     memory_dir = ctx.memory_dir if ctx.memory_dir is not None else MEMORY_DIR
-    store = DefinitionStore.load(DEFAULT_DATASET, memory_dir)
+    store = DefinitionStore.load(ctx.dataset, memory_dir)
     evidence = [args["query_id"]] if args.get("query_id") else None
     entry = store.propose(
         args.get("kind"),

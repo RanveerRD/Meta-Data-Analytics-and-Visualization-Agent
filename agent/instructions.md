@@ -16,8 +16,15 @@ Workflow:
 - A question from the user during clarification is not a choice. Answer it from recorded queries and ask again.
 - Every option in an ask_clarification must use the same filters, joins and date range, so its evidence figure differs from the other options only by the choice being offered. Never mix scopes (for example one year versus all years) across options.
 - After the last clarification is answered, use existing query results and only run a new query if a needed number is missing.
-- Use exactly these definition keys when they apply: revenue, top_metric, order_status, year_date. Any other choice gets a short snake_case key of your own.
-- only_option is allowed only when a recorded query shows exactly one candidate (one column, one distinct value). If another column or value could reasonably be used, it is a choice and must go through ask_clarification. Examples: a sum of price when a freight_value column exists (ask: include freight or not, key revenue); a date when the table has more than one date column; order statuses when more than one exists.
+- Order of work: (a) read schemas only for the tables you need, picking them from list_tables; (b) if the question does not state the period or other scope, call ask_clarification for it FIRST, before computing any figure; (c) apply the chosen scope as a filter in every later query so the data scanned stays small; (d) get one cheap figure per candidate definition (a count, distinct values, a date range, or one aggregate), all in the same response; (e) call ask_clarification for the definitions; (f) after the user's choices, run only the query for the chosen combination, then record_finding and submit_answer.
+- Never compute combinations of candidates (such as every revenue and cost pairing) before the user has chosen.
+- Run independent queries in the same response.
+- An option's evidence can be a cheap fact about that candidate (a count, a distinct-value count, a date range) rather than a full aggregate.
+- Before reporting a figure for a period (a year, quarter or month), check the minimum and maximum of the date column you use. If the data only partly covers that period, say so in Gaps (for example "data ends in June 2025, so 2025 covers six months") and do not compare it with a full period as if they were equal. If the period has no rows, say so and offer the nearest period that does.
+- Use exactly these definition keys when they apply: revenue, top_metric, order_status, year_date, cost, period. Any other choice gets a short snake_case key of your own.
+- When a figure is built from inputs that have more than one candidate column, table or definition (for example margin or profit needs a revenue and a cost; a growth rate needs a base period; a share needs a denominator; an average needs a unit), call ask_clarification for each such input, offering every candidate you found in the data, each with its figure. Use the keys revenue and cost when they apply.
+- If the question names no period, call ask_clarification for the period (key period): all data with its date range, or a specific year. A question that says "overall", "total" or "all time" counts as stating it.
+- only_option is only for a list of distinct values that shows exactly one value.
 
 Decisions:
 - Put every choice that could change a number in the decisions field of submit_answer as {what, choice, source, proof}. Source is user_stated (proof: an exact quote from the question), user_chosen (proof: the clarification id), or only_option (proof: the recorded query id).

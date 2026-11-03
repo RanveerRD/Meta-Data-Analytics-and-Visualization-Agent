@@ -19,16 +19,16 @@ from agent.tools import TOOL_SCHEMAS, ToolContext, dispatch
 
 MODEL_DEFAULT = "muse-spark-1.3-contributor"
 BASE_URL = "https://api.meta.ai/v1"
-MAX_TURNS = 20
+MAX_TURNS = 30
 REMINDER_TURNS = 3
-CAP_MESSAGE = "Reached the 20-turn limit without a final answer."
+CAP_MESSAGE = f"Reached the {MAX_TURNS}-turn limit without a final answer."
 SUBMIT_REMINDER = (
     "You replied in plain text without submitting. Record a finding for "
     "each key number with record_finding, then call submit_answer. "
     "Do not answer in plain text."
 )
 WRAP_UP_NUDGE = (
-    "Only 3 rounds remain. Stop running new queries and call submit_answer "
+    "Only 4 rounds remain. Stop running new queries and call submit_answer "
     "now using the findings already recorded."
 )
 
@@ -320,6 +320,7 @@ def answer_question(
     question: str,
     runs_dir: Path = RUNS_DIR,
     ask_user: Any = None,
+    dataset: str = "olist",
 ) -> TurnResult:
     """Ask one question, keeping shared history.
 
@@ -327,7 +328,11 @@ def answer_question(
     clarification do not count because they are waiting for the human.
     """
     ctx = ToolContext(
-        backend=backend, question=question, runs_dir=runs_dir, ask_user=ask_user
+        backend=backend,
+        question=question,
+        runs_dir=runs_dir,
+        ask_user=ask_user,
+        dataset=dataset,
     )
     history.append({"role": "user", "content": question})
     snapshot = len(history) - 1
@@ -341,7 +346,7 @@ def answer_question(
         if budget >= MAX_TURNS:
             capped = True
             break
-        if budget == MAX_TURNS - 3 and not nudged:
+        if budget == MAX_TURNS - 4 and not nudged:
             history.append({"role": "user", "content": WRAP_UP_NUDGE})
             nudged = True
         calls_before = (
