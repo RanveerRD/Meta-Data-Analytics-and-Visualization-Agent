@@ -98,6 +98,7 @@ class SqliteBackend:
 
     def __init__(self, path: str | Path) -> None:
         self._conn = open_sqlite_readonly(path)
+        self.path = Path(path)
 
     @property
     def dialect(self) -> str:

@@ -36,6 +36,7 @@ REGISTRY: dict[str, dict[str, Any]] = {
         "label": "Olist",
         "prompt": "olist> ",
         "make_backend": _olist_backend,
+        "bi": {"connector": "datasette", "database": "olist"},
     },
     "adventureworks": {
         "description": (
@@ -44,5 +45,6 @@ REGISTRY: dict[str, dict[str, Any]] = {
         "label": "AdventureWorks",
         "prompt": "adventureworks> ",
         "make_backend": _adventureworks_backend,
+        "bi": {"connector": "metabase", "database": "adventureworks"},
     },
 }

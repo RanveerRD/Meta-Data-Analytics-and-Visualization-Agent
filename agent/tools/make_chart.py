@@ -32,7 +32,7 @@ SCHEMA: dict[str, Any] = {
         "Draw a bar or line chart from the rows of a query already run in "
         "this record. Use only when the user asks for a chart, graph or "
         "plot. The query must be cited by a recorded finding first. "
-        "Returns the code-generated file path and a one-line description."
+        "Returns a one-line description; the file is shown by the console."
     ),
     "parameters": {
         "type": "object",

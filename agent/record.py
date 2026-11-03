@@ -171,6 +171,14 @@ class AnalysisRecord:
     def charts(self) -> list[dict[str, Any]]:
         return copy.deepcopy(self._state.get("charts", []))
 
+    def note_publish(self, connector: str, query_id: str, url: str) -> None:
+        """Audit a BI publish; the link itself lives in the BI tool."""
+        self._append_audit(
+            "publish",
+            {"connector": connector, "query_id": query_id, "url": url},
+        )
+        self.save()
+
     def record_chart(
         self,
         query_id: str,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import shlex
 from functools import partial
 from typing import Any
 
@@ -132,10 +133,13 @@ def _handle_command(
         print("/forget <key> - retire the approved note for a key")
         print("/datasets - list available datasets")
         print("/chart [n] [bar|line] - draw an offered chart for the last answer")
+        print("/publish [n] - share an offered chart as a BI link")
         print("/help - show this list")
         return True
     if line == "/chart" or line.startswith("/chart "):
         return _run_chart_command(line, pending_charts)
+    if line == "/publish" or line.startswith("/publish "):
+        return _run_publish_command(line, pending_charts, dataset)
     if line == "/notes":
         approved = DefinitionStore.load(dataset, memory_dir).approved_entries()
         if not approved:
@@ -164,16 +168,69 @@ def _print_new_charts(text: str, charts: list[str]) -> None:
             print(f"chart saved: {path}")
 
 
-def _offer_charts(candidates: list[dict], drawn: list[str]) -> None:
+def _offer_charts(
+    candidates: list[dict], drawn: list[str], connector: str | None = None
+) -> None:
     """Print one offer line per candidate. No model call, no tokens."""
     drawn_ids = set(drawn)
     for i, candidate in enumerate(candidates, 1):
-        suffix = " (already drawn)" if candidate["query_id"] in drawn_ids else ""
+        action = f"Type /chart {i}"
+        if connector:
+            action += f" or /publish {i} ({connector})"
+        if candidate["query_id"] in drawn_ids:
+            action += " (already drawn)"
         print(
             f"Chart available: {i}. {candidate['type']} chart of "
             f"{candidate['y']} by {candidate['x']} "
-            f"({candidate['points']} points). Type /chart {i}{suffix}"
+            f"({candidate['points']} points). {action}"
         )
+
+
+def _run_publish_command(line: str, pending: dict | None, dataset: str) -> bool:
+    """Share a stored candidate as a BI link. No model call, no tokens."""
+    from agent.bi import CONNECTORS
+    from agent.tools.make_chart import _code_title
+
+    if not pending or not pending["candidates"]:
+        print("No chart available for the last answer.")
+        return True
+    bi = REGISTRY.get(dataset, {}).get("bi")
+    if bi is None:
+        print(f"No BI connector configured for {dataset}")
+        return True
+    number = 1
+    for token in line.split()[1:]:
+        try:
+            number = int(token)
+        except ValueError:
+            print("usage: /publish [n]")
+            return True
+    candidates = pending["candidates"]
+    if not 1 <= number <= len(candidates):
+        print(f"choose 1 to {len(candidates)}")
+        return True
+    candidate = candidates[number - 1]
+    connector = CONNECTORS[bi["connector"]](database=bi["database"])
+    try:
+        result = connector.publish(
+            candidate["sql"],
+            _code_title(candidate["x"], candidate["y"]),
+            candidate["type"],
+            candidate["x"],
+            candidate["y"],
+        )
+    except (ValueError, RuntimeError) as exc:
+        print(f"error: {exc}")
+        return True
+    record = AnalysisRecord.load(pending["record_abs"])
+    record.note_publish(bi["connector"], candidate["query_id"], result.url)
+    print(result.url)
+    if bi["connector"] == "datasette" and pending.get("sqlite_path"):
+        quoted = shlex.quote(pending["sqlite_path"])
+        print(f"Start Datasette first: datasette serve --immutable {quoted}")
+    if result.note:
+        print(result.note)
+    return True
 
 
 def _format_evidence(value: object) -> str:
@@ -458,11 +515,14 @@ def main(argv: list[str] | None = None) -> int:
             print(result.text)
         _print_new_charts(result.text, result.charts)
         if result.chart_candidates and result.record_path:
+            sqlite_path = getattr(backend, "path", None)
             pending_charts = {
                 "record_abs": REPO_ROOT / result.record_path,
                 "candidates": result.chart_candidates,
+                "sqlite_path": str(sqlite_path) if sqlite_path else None,
             }
-            _offer_charts(result.chart_candidates, result.chart_drawn)
+            connector = REGISTRY.get(dataset, {}).get("bi", {}).get("connector")
+            _offer_charts(result.chart_candidates, result.chart_drawn, connector)
         if result.usage_known:
             print(
                 f"tokens: {result.input_tokens} in / "
