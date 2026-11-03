@@ -22,9 +22,7 @@ from agent.loop import (
     CAP_MESSAGE,
     REPO_ROOT,
     RUNS_DIR,
-    _read_env_file_value,
     answer_question,
-    build_client,
     render_answer,
 )
 from agent.record import AnalysisRecord
@@ -206,11 +204,11 @@ def _write_orchestration(payload: dict[str, Any]) -> str:
 def run_cross_dataset_question(
     question: str,
     datasets: dict[str, dict[str, Any]],
+    client: Any,
+    model: str,
+    ask_user: Any,
 ) -> dict[str, Any]:
     """Plan, run sequential workers, merge; returns everything __main__ renders."""
-    client = build_client()
-    model = os.environ.get("META_MODEL") or _read_env_file_value("META_MODEL") or "muse-spark-1.3-contributor"
-
     selected, planner_tokens = plan_datasets(question, datasets, client, model)
 
     workers: list[dict[str, Any]] = []
@@ -221,17 +219,11 @@ def run_cross_dataset_question(
             "Answer the part of the question this database can answer, "
             "and say in Gaps what it cannot."
         )
-        def _ask_user(prompt: str, labels: list[str], _name: str = name) -> str:
-            print(f"[{_name}] {prompt}")
-            for i, label in enumerate(labels, 1):
-                print(f"  {i}. {label}")
-            print("  0. something else (type your own)")
-            reply = input(f"[{_name}] choice: ").strip()
-            if reply == "":
-                return labels[0]
-            if reply.isdigit() and 1 <= int(reply) <= len(labels):
-                return labels[int(reply) - 1]
-            return reply
+
+        def _scoped_ask_user(
+            question: str, options: list[dict[str, Any]], _name: str = name
+        ) -> dict[str, str]:
+            return ask_user(f"[{_name}] {question}", options)
 
         result = answer_question(
             client,
@@ -240,7 +232,7 @@ def run_cross_dataset_question(
             info["backend"],
             [],
             question,
-            ask_user=_ask_user,
+            ask_user=_scoped_ask_user,
             dataset=name,
         )
         capped = result.submission is None and CAP_MESSAGE in (result.text or "")

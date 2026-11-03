@@ -87,9 +87,33 @@ def _worker_answer(text: str, tokens: int = 3) -> TurnResult:
     )
 
 
-def _run(question, mapping, client, worker_texts, ask_user_calls=None):
-    """Run the orchestrator with patched boundaries; returns (outcome, seen)."""
+_OPTIONS = [
+    {
+        "label": "delivered only",
+        "query_id": "q1",
+        "evidence": ["delivered"],
+        "explanation": "excludes other statuses",
+    },
+    {
+        "label": "all orders",
+        "query_id": "q1",
+        "evidence": ["everything"],
+        "explanation": "includes every status",
+    },
+]
+
+
+def _run(question, mapping, client, worker_texts, ask_user=None):
+    """Run the orchestrator with patched boundaries.
+
+    Returns (outcome, seen, asked): the fake worker calls the wrapped
+    ask_user once per dataset with ("Which scope?", _OPTIONS); asked
+    holds what the wrapper returned each time.
+    """
     seen: list[dict[str, Any]] = []
+    asked: list[dict[str, str]] = []
+    if ask_user is None:
+        ask_user = lambda q, o: {"choice": o[0]["label"]}  # noqa: E731
 
     def _fake_answer(client_, model_, instructions_, backend_, history_, question_, **kwargs):
         seen.append(
@@ -98,15 +122,13 @@ def _run(question, mapping, client, worker_texts, ask_user_calls=None):
                 "instructions": instructions_,
                 "dataset": kwargs.get("dataset"),
                 "history": history_,
+                "model": model_,
             }
         )
-        if ask_user_calls is not None:
-            reply = kwargs["ask_user"]("Which scope?", ["x", "y"])
-            ask_user_calls.append(reply)
+        asked.append(kwargs["ask_user"]("Which scope?", _OPTIONS))
         return worker_texts[kwargs.get("dataset")]
 
     with (
-        mock.patch.object(orchestrator, "build_client", return_value=client),
         mock.patch.object(orchestrator, "answer_question", side_effect=_fake_answer),
         mock.patch.object(
             orchestrator.AnalysisRecord,
@@ -114,8 +136,10 @@ def _run(question, mapping, client, worker_texts, ask_user_calls=None):
             return_value=SimpleNamespace(clarifications=[]),
         ),
     ):
-        outcome = orchestrator.run_cross_dataset_question(question, mapping)
-    return outcome, seen
+        outcome = orchestrator.run_cross_dataset_question(
+            question, mapping, client, "fake-model", ask_user
+        )
+    return outcome, seen, asked
 
 
 @pytest.fixture
@@ -182,7 +206,7 @@ def test_workers_run_in_mapping_order_with_scope(_tmp_run_dirs):
             _merge_response("Bee total is 10. Ay total is 20. Cee total is 30."),
         ]
     )
-    outcome, seen = _run("How many?", _mapping(), client, texts)
+    outcome, seen, _asked = _run("How many?", _mapping(), client, texts)
     assert outcome["routing"] == ["b", "a", "c"]
     assert [s["dataset"] for s in seen] == ["b", "a", "c"]
     for s in seen:
@@ -203,20 +227,56 @@ def test_third_fake_dataset_proves_nothing_hard_coded(_tmp_run_dirs):
     client = _FakeClient(
         [_plan_response(["c"]), _merge_response("Cee total is 30.")]
     )
-    outcome, seen = _run("How many?", _mapping(), client, texts)
+    outcome, seen, _asked = _run("How many?", _mapping(), client, texts)
     assert outcome["routing"] == ["c"]
     assert [s["dataset"] for s in seen] == ["c"]
     assert outcome["merged"] == "Cee total is 30."
 
 
-def test_clarification_prompt_carries_dataset_prefix(_tmp_run_dirs, capsys):
+def test_uses_injected_client_model_never_build_client(_tmp_run_dirs):
+    assert "build_client" not in Path("agent/orchestrator.py").read_text()
     texts = {"b": _worker_answer("Bee total is 10.")}
     client = _FakeClient([_plan_response(["b"]), _merge_response("Bee total is 10.")])
-    replies: list[str] = []
-    with mock.patch("builtins.input", return_value="1"):
-        _run("How many?", _mapping(("b",)), client, texts, ask_user_calls=replies)
-    assert replies == ["x"]
-    assert "[b]" in capsys.readouterr().out
+    outcome, seen, _asked = _run("How many?", _mapping(("b",)), client, texts)
+    assert outcome["merged"] == "Bee total is 10."
+    assert seen[0]["model"] == "fake-model"
+    assert all(call.get("model") == "fake-model" for call in client.calls)
+
+
+def test_worker_ask_user_gets_option_dicts_prefixed(_tmp_run_dirs):
+    received: list[tuple] = []
+
+    def _inner(question, options):
+        received.append((question, options))
+        return {"user_question": "what about 2018?"}
+
+    texts = {"b": _worker_answer("Bee total is 10.")}
+    client = _FakeClient([_plan_response(["b"]), _merge_response("Bee total is 10.")])
+    _outcome, _seen, asked = _run(
+        "How many?", _mapping(("b",)), client, texts, ask_user=_inner
+    )
+    assert received[0][0] == "[b] Which scope?"
+    assert received[0][1] is _OPTIONS
+    assert all(isinstance(o, dict) and "label" in o for o in received[0][1])
+    assert asked == [{"user_question": "what about 2018?"}]
+
+
+def test_console_ask_user_through_wrapper(_tmp_run_dirs, capsys):
+    from agent.__main__ import _console_ask_user
+
+    texts = {"b": _worker_answer("Bee total is 10.")}
+    client = _FakeClient([_plan_response(["b"]), _merge_response("Bee total is 10.")])
+    _outcome, _seen, asked = _run(
+        "How many?",
+        _mapping(("b",)),
+        client,
+        texts,
+        ask_user=lambda q, o: _console_ask_user(q, o, input_fn=lambda _: "2"),
+    )
+    assert asked == [{"choice": "all orders"}]
+    out = capsys.readouterr().out
+    assert "[b] Which scope?" in out
+    assert "delivered only" in out and "all orders" in out
 
 
 # --- merge verification ---
@@ -232,7 +292,7 @@ def test_merge_unmatched_retried_then_fallback(_tmp_run_dirs):
             _merge_response("Bee total is 999."),
         ]
     )
-    outcome, _ = _run("How many?", _mapping(("b",)), client, texts)
+    outcome, _, _asked = _run("How many?", _mapping(("b",)), client, texts)
     assert outcome["merged"] == ""
     assert outcome["verification"]["status"] == "fallback"
     assert outcome["verification"]["unmatched"] == ["999"]
@@ -242,7 +302,7 @@ def test_merge_unmatched_retried_then_fallback(_tmp_run_dirs):
 def test_merge_use_separate_shows_answers_separately(_tmp_run_dirs):
     texts = {"b": _worker_answer("Bee total is 10.")}
     client = _FakeClient([_plan_response(["b"]), _merge_response(None, separate=True)])
-    outcome, _ = _run("How many?", _mapping(("b",)), client, texts)
+    outcome, _, _asked = _run("How many?", _mapping(("b",)), client, texts)
     assert outcome["merged"] == ""
     assert outcome["verification"]["status"] == "separate"
 
@@ -261,7 +321,7 @@ def test_failed_worker_excluded_from_merge(_tmp_run_dirs):
         return real_merge(question, answers, client_, model_)
 
     with mock.patch.object(orchestrator, "merge_answers", side_effect=_spy):
-        outcome, _ = _run("How many?", _mapping(("b", "a")), client, texts)
+        outcome, _, _asked = _run("How many?", _mapping(("b", "a")), client, texts)
     assert outcome["failed"] == ["a"]
     assert merge_inputs == ["Bee total is 10."]
     assert outcome["merged"] == "Bee total is 10."
@@ -275,7 +335,7 @@ def test_orchestration_record_written(_tmp_run_dirs):
     client = _FakeClient(
         [_plan_response(["b", "a"]), _merge_response("Bee total is 10. Ay total is 20.")]
     )
-    outcome, _ = _run("How many?", _mapping(("b", "a")), client, texts)
+    outcome, _, _asked = _run("How many?", _mapping(("b", "a")), client, texts)
     record_file = _tmp_run_dirs / outcome["orchestration_path"]
     payload = json.loads(record_file.read_text())
     assert payload["question"] == "How many?"
@@ -304,3 +364,37 @@ def test_parse_args_all_and_registry_default():
     assert parse_args(["--dataset", "olist"]).dataset == "olist"
     with pytest.raises(SystemExit):
         parse_args(["--dataset", "nope"])
+
+
+def test_datasets_command_lists_registry(capsys):
+    from agent.__main__ import _handle_command
+
+    assert _handle_command("/datasets", dataset="olist") is True
+    out = capsys.readouterr().out
+    for name, entry in REGISTRY.items():
+        assert f"{name} ({entry['label']}): {entry['description']}" in out
+    assert "olist (Olist)" in out and "(current)" in out
+    assert "Run with --dataset <name> or --dataset all" in out
+
+
+def test_help_lists_commands(capsys):
+    from agent.__main__ import _handle_command
+
+    assert _handle_command("/help", dataset="olist") is True
+    out = capsys.readouterr().out
+    for cmd in ("/notes", "/forget <key>", "/datasets", "/help"):
+        assert cmd in out
+
+
+def test_datasets_command_includes_third_entry(monkeypatch, capsys):
+    from agent.__main__ import _handle_command
+
+    monkeypatch.setitem(
+        REGISTRY,
+        "zz",
+        {"description": "zz description", "label": "Zz", "prompt": "zz> "},
+    )
+    assert _handle_command("/datasets", dataset="all") is True
+    out = capsys.readouterr().out
+    assert "zz (Zz): zz description" in out
+    assert "asking across all datasets (current)" in out

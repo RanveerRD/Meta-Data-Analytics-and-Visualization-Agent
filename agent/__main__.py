@@ -48,12 +48,31 @@ def _instructions_for_question(
     return instructions + "\n\n" + section
 
 
+def _print_datasets(current: str) -> None:
+    """List every registry dataset; no model call."""
+    for name, entry in REGISTRY.items():
+        marker = " (current)" if name == current else ""
+        print(f"{name} ({entry['label']}): {entry['description']}{marker}")
+    if current == "all":
+        print("asking across all datasets (current)")
+    print("Run with --dataset <name> or --dataset all")
+
+
 def _handle_command(
     line: str, memory_dir=MEMORY_DIR, dataset: str = DEFAULT_DATASET
 ) -> bool:
     """Run a / command. Returns True when the line was a command."""
     if not line.startswith("/"):
         return False
+    if line == "/datasets":
+        _print_datasets(dataset)
+        return True
+    if line == "/help":
+        print("/notes - list approved notes")
+        print("/forget <key> - retire the approved note for a key")
+        print("/datasets - list available datasets")
+        print("/help - show this list")
+        return True
     if line == "/notes":
         approved = DefinitionStore.load(dataset, memory_dir).approved_entries()
         if not approved:
@@ -71,7 +90,7 @@ def _handle_command(
         else:
             print(f"retired {entry['key']}: {entry['text']}")
         return True
-    print("unknown command (try /notes or /forget <key>)")
+    print("unknown command (try /help)")
     return True
 
 
@@ -259,7 +278,7 @@ def _render_all_outcome(outcome: dict) -> None:
     print(f"Orchestration: {outcome['orchestration_path']}")
 
 
-def _run_all_mode() -> int:
+def _run_all_mode(client, model) -> int:
     """Ask one question across every dataset via the orchestrator."""
     from agent.orchestrator import run_cross_dataset_question
 
@@ -284,12 +303,20 @@ def _run_all_mode() -> int:
                 break
             if not question.strip():
                 break
+            if question.strip() == "/datasets":
+                _print_datasets("all")
+                continue
+            if question.strip() == "/help":
+                _handle_command("/help", dataset="all")
+                continue
             if question.strip().startswith("/"):
                 names = " or ".join(REGISTRY)
                 print(f"Use --dataset {names} for saved definitions.")
                 continue
             try:
-                outcome = run_cross_dataset_question(question, datasets)
+                outcome = run_cross_dataset_question(
+                    question, datasets, client, model, _console_ask_user
+                )
             except RuntimeError as exc:
                 print(f"error: {exc}")
                 continue
@@ -309,7 +336,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}")
         return 2
     if dataset == "all":
-        return _run_all_mode()
+        return _run_all_mode(client, model)
     try:
         backend = _backend_for_dataset(dataset)
     except RuntimeError as exc:
