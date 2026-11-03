@@ -81,6 +81,7 @@ class TurnResult:
     clarification: dict[str, Any] | None = None
     submission: dict[str, Any] | None = None
     charts: list[str] = field(default_factory=list)
+    chart_notes: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -175,12 +176,13 @@ def render_answer(
     submission: dict[str, Any],
     clarifications: list[dict[str, Any]],
     charts: list[str] | None = None,
+    chart_notes: list[str] | None = None,
 ) -> str:
     """Render the accepted answer with its decisions and gaps.
 
     The Gaps section is always present; with no gaps found it reads
-    "- none found". Chart lines are appended by code after acceptance,
-    so chart paths never pass through number extraction.
+    "- none found". Chart and chart-note lines are appended by code after
+    acceptance, so they never pass through number extraction.
     """
     lines = [submission["answer"], "", "Decisions:"]
     lines.extend(
@@ -199,8 +201,11 @@ def render_answer(
     else:
         lines.append("- none found")
     lines.extend(["", EVIDENCE_QUESTION])
-    for path in charts or []:
+    notes = list(chart_notes or [])
+    for i, path in enumerate(charts or []):
         lines.append(f"Chart: {path}")
+        if i < len(notes) and notes[i]:
+            lines.append(f"Chart note: {notes[i]}")
     return "\n".join(lines)
 
 
@@ -419,10 +424,14 @@ def answer_question(
             clarification=clarification,
         )
     verification: str | None = None
-    chart_paths = [c["path"] for c in ctx.record.charts] if ctx.record is not None else []
+    chart_entries = ctx.record.charts if ctx.record is not None else []
+    chart_paths = [c["path"] for c in chart_entries]
+    chart_notes = [c.get("note", "") for c in chart_entries]
     if ctx.record is not None:
         if submission is not None:
-            text = render_answer(submission, ctx.record.clarifications, chart_paths)
+            text = render_answer(
+                submission, ctx.record.clarifications, chart_paths, chart_notes
+            )
             verification = (
                 f"verification: {len(submission['matched'])} numbers matched, "
                 f"{len(submission['unmatched'])} unmatched"
@@ -448,4 +457,5 @@ def answer_question(
         clarification=clarification,
         submission=submission,
         charts=chart_paths,
+        chart_notes=chart_notes,
     )

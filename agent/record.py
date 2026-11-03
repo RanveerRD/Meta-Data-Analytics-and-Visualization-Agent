@@ -181,6 +181,7 @@ class AnalysisRecord:
         path: str,
         points: int,
         skipped: int,
+        note: str = "",
     ) -> dict[str, Any]:
         """Store a chart made from a recorded query; return its entry."""
         entry = {
@@ -193,6 +194,7 @@ class AnalysisRecord:
             "path": path,
             "points": points,
             "skipped": skipped,
+            "note": note,
             "timestamp": _utc_now_iso(),
         }
         self._state.setdefault("charts", []).append(entry)

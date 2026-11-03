@@ -19,6 +19,7 @@ from agent.tools.make_chart import (  # noqa: E402
     REPO_ROOT,
     _MAX_WIDTH,
     _display_path,
+    _missing_periods,
     _render_figure,
 )
 
@@ -250,6 +251,100 @@ def test_display_path_relative_under_root():
         == "workspace/charts/x-1.png"
     )
     assert _display_path("/tmp/other/y.png") == "/tmp/other/y.png"
+
+
+def _dated_ctx(tmp_path, labels, values):
+    rows = [[label, value] for label, value in zip(labels, values)]
+    return _chart_ctx(tmp_path, rows=rows, columns=("month", "revenue"))
+
+
+def test_missing_periods_monthly():
+    assert _missing_periods(["2017-02", "2016-09"]) == [
+        "2016-10",
+        "2016-11",
+        "2016-12",
+        "2017-01",
+    ]
+    assert _missing_periods(["2016-09", "2016-10", "2016-11"]) == []
+
+
+def test_missing_periods_yearly():
+    assert _missing_periods(["2015", "2017"]) == ["2016"]
+
+
+def test_missing_periods_non_date():
+    assert _missing_periods(["a", "b"]) == []
+    assert _missing_periods(["2016-09", "oops"]) == []
+
+
+def test_monthly_gap_breaks_line_and_notes(tmp_path):
+    ctx, qid = _dated_ctx(tmp_path, ["2016-09", "2016-10", "2017-02"], [1.0, 2.0, 3.0])
+    result = _chart(ctx, qid, x_column="month", title="Monthly revenue")
+    assert result["ok"] is True
+    entry = ctx.record.charts[0]
+    assert entry["note"] == "no data for 2016-11, 2016-12, 2017-01 (not drawn)"
+    text = render_answer(
+        {"answer": "a", "decisions": [], "gaps": [], "matched": [], "unmatched": []},
+        [],
+        [entry["path"]],
+        [entry["note"]],
+    )
+    chart_line = next(i for i, l in enumerate(text.splitlines()) if l.startswith("Chart:"))
+    assert text.splitlines()[chart_line + 1] == (
+        "Chart note: no data for 2016-11, 2016-12, 2017-01 (not drawn)"
+    )
+    fig, ax = _render_figure(
+        ["2016-09", "2016-10", "2016-11", "2016-12", "2017-01", "2017-02"],
+        [1.0, 2.0, float("nan"), float("nan"), float("nan"), 3.0],
+        "line",
+        "T",
+        "month",
+        "revenue",
+    )
+    try:
+        ydata = list(ax.lines[0].get_ydata())
+        assert ydata[2] != ydata[2]  # NaN breaks the line at the gap
+        assert ydata[0] == 1.0 and ydata[-1] == 3.0
+    finally:
+        plt.close(fig)
+
+
+def test_complete_series_produces_no_note(tmp_path):
+    ctx, qid = _dated_ctx(tmp_path, ["2016-09", "2016-10", "2016-11"], [1.0, 2.0, 3.0])
+    result = _chart(ctx, qid, x_column="month", title="Monthly revenue")
+    assert result["ok"] is True
+    assert ctx.record.charts[0]["note"] == ""
+    text = render_answer(
+        {"answer": "a", "decisions": [], "gaps": [], "matched": [], "unmatched": []},
+        [],
+        [ctx.record.charts[0]["path"]],
+        [""],
+    )
+    assert "Chart note:" not in text
+
+
+def test_yearly_gap_notes(tmp_path):
+    ctx, qid = _dated_ctx(tmp_path, ["2015", "2017"], [1.0, 2.0])
+    result = _chart(ctx, qid, x_column="month", chart_type="bar", title="Yearly")
+    assert result["ok"] is True
+    assert ctx.record.charts[0]["note"] == "no data for 2016 (not drawn)"
+
+
+def test_non_date_x_never_notes(tmp_path):
+    ctx, qid = _chart_ctx(tmp_path)
+    result = _chart(ctx, qid)
+    assert result["ok"] is True
+    assert ctx.record.charts[0]["note"] == ""
+
+
+def test_long_gap_caps_at_six_periods(tmp_path):
+    labels = ["2016-01", "2016-10"]
+    ctx, qid = _dated_ctx(tmp_path, labels, [1.0, 2.0])
+    result = _chart(ctx, qid, x_column="month", title="Monthly revenue")
+    assert result["ok"] is True
+    note = ctx.record.charts[0]["note"]
+    assert note.startswith("no data for 2016-02, 2016-03, 2016-04, 2016-05, 2016-06, 2016-07")
+    assert note.endswith("and 2 more (not drawn)")
 
 
 def test_render_chart_line_never_verified():
