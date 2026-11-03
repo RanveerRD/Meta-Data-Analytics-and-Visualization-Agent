@@ -214,6 +214,7 @@ def test_workers_run_in_mapping_order_with_scope(_tmp_run_dirs):
         assert s["history"] == []
         assert s["instructions"].startswith(f"INSTRUCTIONS-{s['dataset']}")
         assert f"Scope: use only the {s['dataset']} data:" in s["instructions"]
+        assert "not tables inside this one" in s["instructions"]
     assert outcome["merged"] == "Bee total is 10. Ay total is 20. Cee total is 30."
     assert outcome["verification"] == {"status": "verified", "unmatched": []}
 
@@ -375,6 +376,16 @@ def test_datasets_command_lists_registry(capsys):
         assert f"{name} ({entry['label']}): {entry['description']}" in out
     assert "olist (Olist)" in out and "(current)" in out
     assert "Run with --dataset <name> or --dataset all" in out
+
+
+def test_merge_prompt_answers_briefly():
+    from agent.orchestrator import MERGE_SYSTEM
+
+    assert "as briefly as the question allows" in MERGE_SYSTEM
+    assert "include exactly those items for each database" in MERGE_SYSTEM
+    assert "leader per database" in MERGE_SYSTEM
+    assert "do not repeat the definitions and gaps" in MERGE_SYSTEM
+    assert "only numbers that appear in those texts" in MERGE_SYSTEM
 
 
 def test_help_lists_commands(capsys):
