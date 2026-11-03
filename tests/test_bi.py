@@ -1,9 +1,13 @@
-"""BI connectors and /publish (no API calls, no network)."""
+"""BI connectors and /publish (no API calls, no real network)."""
 
 from __future__ import annotations
 
+import json
 import shlex
+import socket
 import sys
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -67,9 +71,12 @@ def test_datasette_url_override_and_scheme(monkeypatch):
         DatasetteConnector("db").publish("select 1", "t", "bar", "a", "b")
 
 
-def test_metabase_stub():
-    with pytest.raises(RuntimeError, match="not configured"):
-        MetabaseConnector("adventureworks").publish("select 1", "t", "bar", "a", "b")
+def test_metabase_bad_chart_type_no_network(monkeypatch):
+    monkeypatch.setenv("METABASE_URL", "http://127.0.0.1:1")
+    monkeypatch.setenv("METABASE_API_KEY", "k")
+    with pytest.raises(ValueError, match="bar"):
+        MetabaseConnector("adventureworks").publish(
+            "select 1", "t", "pie", "a", "b")
 
 
 def test_connector_registry():
@@ -173,3 +180,255 @@ def test_all_mode_prints_nothing(capsys):
 def test_help_mentions_publish(capsys):
     assert _handle_command("/help", dataset="olist") is True
     assert "/publish [n]" in capsys.readouterr().out
+
+
+class _FakeMetabase:
+    """Local HTTP stand-in for Metabase; logs every request it receives."""
+
+    def __init__(self, routes: dict):
+        self.routes = routes
+        self.requests: list[dict] = []
+        handler = self._handler()
+        self.server = HTTPServer(("127.0.0.1", 0), handler)
+        self.base = f"http://127.0.0.1:{self.server.server_port}"
+        self.thread = threading.Thread(
+            target=self.server.serve_forever, daemon=True)
+
+    def _handler(self):
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def _answer(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                outer.requests.append({
+                    "method": self.command,
+                    "path": self.path.split("?")[0],
+                    "api_key": self.headers.get("x-api-key"),
+                    "body": self.rfile.read(length) if length else b"",
+                })
+                route = outer.routes.get(
+                    (self.command, self.path.split("?")[0]), (404, b"nope"))
+                if len(route) == 3:
+                    status, body, extra = route
+                else:
+                    status, body = route
+                    extra = {}
+                raw = body.encode() if isinstance(body, str) else body
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                for key, value in extra.items():
+                    self.send_header(key, value)
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def do_GET(self):
+                self._answer()
+
+            def do_POST(self):
+                self._answer()
+
+            def log_message(self, *args):
+                pass
+
+        return Handler
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *args):
+        self.server.shutdown()
+        self.thread.join()
+        self.server.server_close()
+
+
+def _metabase_env(monkeypatch, base, key="TESTKEY-abc123"):
+    monkeypatch.setenv("METABASE_URL", base)
+    monkeypatch.setenv("METABASE_API_KEY", key)
+    return key
+
+
+def test_metabase_publishes_card(monkeypatch):
+    from agent.bi.metabase import MetabaseConnector
+
+    bodies: list[dict] = []
+
+    with _FakeMetabase({
+        ("GET", "/api/database"): (200, json.dumps({"data": [
+            {"id": 7, "name": "adventureworks"}, {"id": 8, "name": "other"}]})),
+        ("POST", "/api/card"): (200, json.dumps({"id": 77})),
+    }) as fake:
+        key = _metabase_env(monkeypatch, fake.base)
+        result = MetabaseConnector("adventureworks").publish(
+            "SELECT 1", "revenue by region", "bar", "region", "revenue")
+    assert result.url == f"{fake.base}/question/77"
+    assert result.note == "saved question created"
+    assert len(fake.requests) == 2
+    assert all(r["api_key"] == key for r in fake.requests)
+    post = next(r for r in fake.requests if r["method"] == "POST")
+    bodies.append(json.loads(post["body"]))
+    assert bodies[0] == {
+        "name": "Agent: revenue by region",
+        "dataset_query": {
+            "type": "native", "database": 7, "native": {"query": "SELECT 1"}},
+        "display": "bar",
+        "visualization_settings": {
+            "graph.dimensions": ["region"], "graph.metrics": ["revenue"]},
+        "collection_id": None,
+    }
+
+
+def test_metabase_plain_list_shape(monkeypatch):
+    from agent.bi.metabase import MetabaseConnector
+
+    with _FakeMetabase({
+        ("GET", "/api/database"): (200, json.dumps([{"id": 5, "name": "adventureworks"}])),
+        ("POST", "/api/card"): (200, json.dumps({"id": 9})),
+    }) as fake:
+        _metabase_env(monkeypatch, fake.base)
+        result = MetabaseConnector("adventureworks").publish(
+            "SELECT 1", "t", "line", "x", "y")
+    assert result.url == f"{fake.base}/question/9"
+
+
+def test_metabase_unknown_database(monkeypatch):
+    from agent.bi.metabase import MetabaseConnector
+
+    with _FakeMetabase({
+        ("GET", "/api/database"): (200, json.dumps({"data": [
+            {"id": 1, "name": "sample"}, {"id": 2, "name": "other"}]})),
+    }) as fake:
+        _metabase_env(monkeypatch, fake.base)
+        with pytest.raises(ValueError, match="available: other, sample"):
+            MetabaseConnector("adventureworks").publish(
+                "SELECT 1", "t", "bar", "x", "y")
+
+
+def test_metabase_401_and_refused(monkeypatch):
+    from agent.bi.metabase import MetabaseConnector
+
+    with _FakeMetabase({("GET", "/api/database"): (401, "bad key")}) as fake:
+        _metabase_env(monkeypatch, fake.base)
+        with pytest.raises(RuntimeError, match="rejected the API key"):
+            MetabaseConnector("adventureworks").publish(
+                "SELECT 1", "t", "bar", "x", "y")
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    dead = f"http://127.0.0.1:{sock.getsockname()[1]}"
+    sock.close()
+    _metabase_env(monkeypatch, dead)
+    with pytest.raises(RuntimeError, match="not reachable"):
+        MetabaseConnector("adventureworks").publish(
+            "SELECT 1", "t", "bar", "x", "y")
+
+
+def test_metabase_missing_key_makes_no_request(monkeypatch):
+    import agent.bi.metabase as metabase_mod
+    from agent.bi.metabase import MetabaseConnector
+
+    with _FakeMetabase({}) as fake:
+        monkeypatch.setenv("METABASE_URL", fake.base)
+        monkeypatch.delenv("METABASE_API_KEY", raising=False)
+        monkeypatch.setattr(metabase_mod, "_read_env_file_value",
+                            lambda name: None)
+        with pytest.raises(RuntimeError, match="not set"):
+            MetabaseConnector("adventureworks").publish(
+                "SELECT 1", "t", "bar", "x", "y")
+    assert fake.requests == []
+
+
+def test_metabase_never_follows_redirects(monkeypatch):
+    from agent.bi.metabase import MetabaseConnector
+
+    with _FakeMetabase({}) as second:
+        routes = {("GET", "/api/database"): (
+            302, b"", {"Location": f"{second.base}/api/database"})}
+        with _FakeMetabase(routes) as first:
+            key = _metabase_env(monkeypatch, first.base)
+            with pytest.raises(RuntimeError, match="redirected"):
+                MetabaseConnector("adventureworks").publish(
+                    "SELECT 1", "t", "bar", "x", "y")
+    assert len(first.requests) == 1
+    assert first.requests[0]["api_key"] == key
+    assert second.requests == []
+
+
+def test_metabase_key_never_leaks(tmp_path, monkeypatch, capsys):
+    from agent.bi.metabase import MetabaseConnector
+
+    key = "SECRET-xyz-999"
+    with _FakeMetabase({
+        ("GET", "/api/database"): (200, json.dumps([{"id": 1, "name": "adventureworks"}])),
+        ("POST", "/api/card"): (400, "card blew up: bad viz"),
+    }) as fake:
+        _metabase_env(monkeypatch, fake.base, key)
+        with pytest.raises(RuntimeError) as excinfo:
+            MetabaseConnector("adventureworks").publish(
+                "SELECT 1", "t", "bar", "x", "y")
+        record = _record(tmp_path)
+        record.note_publish("metabase", "q1", f"{fake.base}/question/1")
+        print(f"error: {excinfo.value}")
+        audit_text = json.dumps(
+            AnalysisRecord.load(record.path).audit[-1]["detail"])
+    assert key not in str(excinfo.value)
+    assert key not in capsys.readouterr().out
+    assert key not in audit_text
+
+
+def test_metabase_nonhttp_refused(monkeypatch):
+    from agent.bi.metabase import MetabaseConnector
+
+    monkeypatch.setenv("METABASE_URL", "ftp://x/y")
+    monkeypatch.setenv("METABASE_API_KEY", "k")
+    with pytest.raises(ValueError, match="http"):
+        MetabaseConnector("adventureworks").publish(
+            "SELECT 1", "t", "bar", "x", "y")
+
+
+def test_requires_approval_flags():
+    from agent.bi.datasette import DatasetteConnector
+    from agent.bi.metabase import MetabaseConnector
+
+    assert DatasetteConnector.requires_approval is False
+    assert MetabaseConnector.requires_approval is True
+
+
+def _adventure_pending(tmp_path):
+    record = AnalysisRecord.create("adv?", tmp_path / "runs")
+    record.set_checklist(
+        [{"id": "rev", "question": "Revenue?", "evidence_needed": "sum"}]
+    )
+    record.plan_action([{"item_id": "rev", "steps": ["sum"]}])
+    qid = record.record_query(
+        "SELECT category, revenue FROM t",
+        {"columns": ["category", "revenue"],
+         "rows": [["a", 1.0], ["b", 2.0]],
+         "row_count": 2, "truncated": False},
+    )
+    record.record_finding("rev", "big", qid, 1.0)
+    return {"record_abs": record.path, "sqlite_path": None,
+            "candidates": chart_candidates(record)}
+
+
+def test_publish_console_y_and_n(tmp_path, capsys, monkeypatch):
+    with _FakeMetabase({
+        ("GET", "/api/database"): (200, json.dumps([{"id": 3, "name": "adventureworks"}])),
+        ("POST", "/api/card"): (200, json.dumps({"id": 42})),
+    }) as fake:
+        key = _metabase_env(monkeypatch, fake.base)
+        pending = _adventure_pending(tmp_path)
+        monkeypatch.setattr("builtins.input", lambda _: "Y ")
+        assert _handle_command("/publish 1", dataset="adventureworks",
+                               pending_charts=pending) is True
+        out = capsys.readouterr().out
+        assert f"{fake.base}/question/42" in out
+        assert "saved question created" in out
+        assert len([r for r in fake.requests if r["method"] == "POST"]) == 1
+        monkeypatch.setattr("builtins.input", lambda _: "")
+        assert _handle_command("/publish 1", dataset="adventureworks",
+                               pending_charts=pending) is True
+        out = capsys.readouterr().out
+        assert "Not published." in out
+        assert len([r for r in fake.requests if r["method"] == "POST"]) == 1
+    assert all(r["api_key"] == key for r in fake.requests)

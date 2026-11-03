@@ -15,6 +15,8 @@ _MAX_URL = 8000
 class DatasetteConnector:
     """Build a Datasette+vega chart link for the exact recorded SQL."""
 
+    requires_approval = False
+
     def __init__(self, database: str) -> None:
         self.database = database
 

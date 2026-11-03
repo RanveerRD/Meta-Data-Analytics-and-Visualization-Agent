@@ -210,7 +210,18 @@ def _run_publish_command(line: str, pending: dict | None, dataset: str) -> bool:
         print(f"choose 1 to {len(candidates)}")
         return True
     candidate = candidates[number - 1]
-    connector = CONNECTORS[bi["connector"]](database=bi["database"])
+    connector_cls = CONNECTORS[bi["connector"]]
+    if connector_cls.requires_approval:
+        name = f"Agent: {_code_title(candidate['x'], candidate['y'])}"
+        answer = input(
+            f"Publish to {bi['connector']} as a saved question named "
+            f"'{name}'? It creates one saved question and does not change "
+            "the source data. (y/n)"
+        ).strip().lower()
+        if answer != "y":
+            print("Not published.")
+            return True
+    connector = connector_cls(database=bi["database"])
     try:
         result = connector.publish(
             candidate["sql"],

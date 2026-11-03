@@ -20,6 +20,8 @@ class PublishResult:
 class BIConnector(Protocol):
     """Build a shareable link for one recorded query."""
 
+    requires_approval: bool
+
     def publish(
         self, sql: str, title: str, chart_type: str, x: str, y: str
     ) -> PublishResult:
