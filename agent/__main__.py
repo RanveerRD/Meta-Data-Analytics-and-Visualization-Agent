@@ -7,6 +7,11 @@ import shlex
 from functools import partial
 from typing import Any
 
+from agent.clarify import (
+    _format_evidence,
+    format_options_text,
+    interpret_clarification_reply,
+)
 from agent.datasets import REGISTRY
 from agent.loop import REPO_ROOT, answer_question, build_client
 from agent.record import AnalysisRecord
@@ -262,17 +267,6 @@ def _run_publish_command(line: str, pending: dict | None, dataset: str) -> bool:
     return True
 
 
-def _format_evidence(value: object) -> str:
-    """Format one evidence value; numbers get thousands separators."""
-    if isinstance(value, bool):
-        return str(value)
-    if isinstance(value, int):
-        return f"{value:,}"
-    if isinstance(value, float):
-        return f"{value:,}"
-    return str(value)
-
-
 def _console_ask_user(
     question: str, options: list[dict], input_fn=input
 ) -> dict[str, str]:
@@ -282,13 +276,7 @@ def _console_ask_user(
     else {"user_question": ...}. Bare digits out of range and empty replies
     reprompt locally without touching the model or the call budget.
     """
-    labels = [o["label"] for o in options]
-    print(f"clarification: {question}")
-    for i, option in enumerate(options, 1):
-        marker = " (last used)" if option.get("last_used") else ""
-        print(f"  {i}. {option['label']} [{_format_evidence(option['evidence'])}]{marker}")
-        print(f"     {option['explanation']}")
-    print("  0. something else (type your own)")
+    print(format_options_text(question, options))
     while True:
         reply = input_fn("choice (number): ").strip()
         if reply == "0":
@@ -296,22 +284,12 @@ def _console_ask_user(
             if typed:
                 return {"choice": typed}
             continue
-        try:
-            index = int(reply)
-        except ValueError:
-            index = -1
-        if 1 <= index <= len(labels):
-            return {"choice": labels[index - 1]}
-        if reply == "":
-            for option in options:
-                if option.get("last_used"):
-                    return {"choice": option["label"]}
-            print(f"pick 1 to {len(labels)}, or 0 to type your own")
-            continue
-        if reply.isdigit():
-            print(f"pick 1 to {len(labels)}, or 0 to type your own")
-            continue
-        return {"user_question": reply}
+        kind, value = interpret_clarification_reply(reply, options)
+        if kind == "choice":
+            return {"choice": value}
+        if kind == "question":
+            return {"user_question": value}
+        print(value)
 
 
 def _definition_text(clarification: dict) -> str:
