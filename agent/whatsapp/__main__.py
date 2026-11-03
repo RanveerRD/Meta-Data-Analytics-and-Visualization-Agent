@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from typing import Any
 
 from agent.__main__ import _base_instructions, _instructions_for_question
 from agent.datasets import REGISTRY
@@ -49,28 +50,39 @@ def main() -> int:
     except RuntimeError as exc:
         print(f"error: {exc}")
         return 2
-    instructions = _instructions_for_question(
-        base_instructions, config.dataset, backend.dialect_notes
-    )
     wa_client = WhatsAppClient(
         config.api_version, config.phone_number_id, config.token
     )
 
-    def answer(history: list, question: str, ask_user) -> str | None:
-        result = answer_question(
-            client,
-            model,
-            instructions,
-            backend,
-            history,
-            question,
-            ask_user=ask_user,
-            dataset=config.dataset,
+    def make_answer(session: dict) -> Any:
+        """Build one session's answer function around its worker-thread backend."""
+        session_backend = session["backend"]
+        session_instructions = _instructions_for_question(
+            base_instructions, config.dataset, session_backend.dialect_notes
         )
-        return format_turn_result(result)
+
+        def answer(history: list, question: str, ask_user) -> str | None:
+            result = answer_question(
+                client,
+                model,
+                session_instructions,
+                session_backend,
+                history,
+                question,
+                ask_user=ask_user,
+                dataset=config.dataset,
+            )
+            return format_turn_result(result)
+
+        return answer
 
     print(startup_line(config))
-    WhatsAppServer(config, wa_client, answer).serve(HOST, PORT)
+    WhatsAppServer(
+        config,
+        wa_client,
+        make_answer,
+        backend_factory=REGISTRY[config.dataset]["make_backend"],
+    ).serve(HOST, PORT)
     backend.close()
     return 0
 

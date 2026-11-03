@@ -34,6 +34,7 @@ from agent.whatsapp.config import (  # noqa: E402
 from agent.whatsapp.server import WhatsAppServer, format_turn_result  # noqa: E402
 
 SENDER = "15551234567"
+OTHER = "15557654321"
 SECRET = "shh-secret"
 OPTIONS = [
     {"label": "Alpha", "query_id": "q1", "evidence": ["a"], "explanation": "first"},
@@ -124,10 +125,14 @@ def _wait_until(fn, timeout: float = 10.0) -> bool:
     return False
 
 
-def _server(answer=None, timeout: float = 300.0, **over: Any):
+def _server(answer=None, timeout: float = 300.0, factory=None, **over: Any):
     client = _FakeClient()
     server = WhatsAppServer(
-        _config(**over), client, answer or _answer("ok"), clarify_timeout=timeout
+        _config(**over),
+        client,
+        lambda session: answer or _answer("ok"),
+        clarify_timeout=timeout,
+        backend_factory=factory,
     )
     return server, client
 
@@ -148,7 +153,7 @@ def test_handshake():
 def test_signed_post_processed():
     server, client = _server()
     calls: list = []
-    server.answer_fn = _answer("done", calls)
+    server.make_answer = lambda session: _answer("done", calls)
     assert _post(server, _payload(body="how many?")) == 200
     assert _wait_until(lambda: client.bodies() == ["done"])
     assert calls == ["how many?"]
@@ -158,7 +163,7 @@ def test_signature_variants_rejected():
     for style in ("noprefix", "wrong", "missing"):
         server, client = _server()
         calls: list = []
-        server.answer_fn = _answer("done", calls)
+        server.make_answer = lambda session: _answer("done", calls)
         assert _post(server, _payload(), style=style) == 403
         assert calls == [] and client.bodies() == []
     server, _client = _server()
@@ -168,7 +173,7 @@ def test_signature_variants_rejected():
 def test_non_allowlisted_sender_ignored():
     server, client = _server()
     calls: list = []
-    server.answer_fn = _answer("done", calls)
+    server.make_answer = lambda session: _answer("done", calls)
     assert _post(server, _payload(sender="19998887777")) == 200
     assert calls == [] and client.bodies() == []
 
@@ -176,7 +181,7 @@ def test_non_allowlisted_sender_ignored():
 def test_duplicate_message_processed_once():
     server, client = _server()
     calls: list = []
-    server.answer_fn = _answer("done", calls)
+    server.make_answer = lambda session: _answer("done", calls)
     assert _post(server, _payload(mid="wamid.9")) == 200
     assert _post(server, _payload(mid="wamid.9")) == 200
     assert _wait_until(lambda: len(client.bodies()) == 1)
@@ -187,7 +192,7 @@ def test_duplicate_message_processed_once():
 def test_non_text_and_statuses_ignored():
     server, client = _server()
     calls: list = []
-    server.answer_fn = _answer("done", calls)
+    server.make_answer = lambda session: _answer("done", calls)
     assert _post(server, _payload(mtype="image")) == 200
     payload = {"entry": [{"changes": [{"value": {"statuses": [{"id": "x"}]}}]}]}
     assert _post(server, payload) == 200
@@ -198,7 +203,7 @@ def test_non_text_and_statuses_ignored():
 def test_command_message_rejected():
     server, client = _server()
     calls: list = []
-    server.answer_fn = _answer("done", calls)
+    server.make_answer = lambda session: _answer("done", calls)
     assert _post(server, _payload(body="/chart 1")) == 200
     assert _wait_until(
         lambda: client.bodies() == ["Commands are not available on WhatsApp yet."]
@@ -228,7 +233,7 @@ def _ask_stub(seen: list, reply: str = "picked"):
 def test_clarification_round_trip():
     server, client = _server()
     seen: list = []
-    server.answer_fn = _ask_stub(seen)
+    server.make_answer = lambda session: _ask_stub(seen)
     assert _post(server, _payload(body="which?", mid="wamid.a")) == 200
     assert _wait_until(lambda: len(client.bodies()) >= 1)
     prompt = client.bodies()[0]
@@ -242,7 +247,7 @@ def test_clarification_round_trip():
 def test_zero_then_typed():
     server, client = _server()
     seen: list = []
-    server.answer_fn = _ask_stub(seen)
+    server.make_answer = lambda session: _ask_stub(seen)
     assert _post(server, _payload(body="q", mid="wamid.a")) == 200
     assert _wait_until(lambda: len(client.bodies()) >= 1)
     assert _post(server, _payload(body="0", mid="wamid.b")) == 200
@@ -256,7 +261,7 @@ def test_zero_then_typed():
 def test_question_about_options():
     server, client = _server()
     seen: list = []
-    server.answer_fn = _ask_stub(seen)
+    server.make_answer = lambda session: _ask_stub(seen)
     assert _post(server, _payload(body="q", mid="wamid.a")) == 200
     assert _wait_until(lambda: len(client.bodies()) >= 1)
     assert _post(server, _payload(body="why these?", mid="wamid.b")) == 200
@@ -271,7 +276,7 @@ def test_clarification_timeout_abandons_turn():
         history.append({"role": "note"})
         return ask_user("Pick?", OPTIONS)
 
-    server.answer_fn = fn
+    server.make_answer = lambda session: fn
     assert _post(server, _payload(body="q", mid="wamid.a")) == 200
     assert _wait_until(lambda: len(client.bodies()) >= 2, timeout=10)
     assert client.bodies()[1] == (
@@ -336,7 +341,7 @@ def test_no_blocking_input_reachable(monkeypatch):
         seen.append(result)
         return "final"
 
-    server.answer_fn = fn
+    server.make_answer = lambda session: fn
     assert _post(server, _payload(body="q", mid="wamid.a")) == 200
     assert _wait_until(lambda: len(client.bodies()) >= 1)
     assert _post(server, _payload(body="1", mid="wamid.b")) == 200
@@ -356,7 +361,7 @@ def test_secrets_never_logged(tmp_path, capsys, caplog):
 
     caplog.set_level(logging.INFO, logger="agent.whatsapp.server")
     server, client = _server()
-    server.answer_fn = _answer("ok")
+    server.make_answer = lambda session: _answer("ok")
     raw = json.dumps(_payload(body="hi")).encode()
     assert server.handle_post(raw, _sign(raw)) == 200
     assert _wait_until(lambda: len(client.bodies()) >= 1)
@@ -375,7 +380,7 @@ def test_secrets_never_logged(tmp_path, capsys, caplog):
 def test_oversize_body_rejected():
     server, client = _server()
     calls: list = []
-    server.answer_fn = _answer("done", calls)
+    server.make_answer = lambda session: _answer("done", calls)
     raw = b"x" * (64 * 1024 + 1)
     status, _ctype, _body = server.dispatch_post("/webhook", len(raw), raw, _sign(raw))
     assert status == 413
@@ -422,7 +427,7 @@ def test_accepted_message_logs_short_id_only(tmp_path, caplog):
 
     caplog.set_level(std_logging.INFO, logger="agent.whatsapp.server")
     server, client = _server()
-    server.answer_fn = _answer("ok")
+    server.make_answer = lambda session: _answer("ok")
     assert _post(server, _payload(body="hello there")) == 200
     assert _wait_until(lambda: len(client.bodies()) >= 1)
     accepted = [
@@ -542,6 +547,115 @@ def test_graph_client_posts(monkeypatch):
     assert all(p["path"] == "/v22.0/pid-9/messages" for p in fake.posts)
 
 
+def _sqlite_db(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "wa.sqlite"
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT);")
+        conn.executemany(
+            "INSERT INTO items (name) VALUES (?)", [("a",), ("b",)]
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return path
+
+
+def _db_answer(session):
+    """Answer through the session's own worker-thread backend."""
+    backend = session["backend"]
+
+    def answer(history, question, ask_user):
+        tables = backend.list_tables()
+        rows = backend.run_sql("SELECT name FROM items ORDER BY id;")["rows"]
+        return f"{tables}:{rows}"
+
+    return answer
+
+
+def test_real_sqlite_backend_in_worker_thread(tmp_path):
+    import threading
+
+    from agent.backend import SqliteBackend
+
+    path = _sqlite_db(tmp_path)
+    factory_threads: list[int] = []
+
+    def factory():
+        factory_threads.append(threading.get_ident())
+        return SqliteBackend(path)
+
+    server, client = _server(factory=factory, timeout=30)
+    server.make_answer = lambda session: _db_answer(session)
+    assert _post(server, _payload(body="q", mid="wamid.r1")) == 200
+    assert _wait_until(lambda: len(client.bodies()) >= 1, timeout=10)
+    assert client.bodies() == ["['items']:[['a'], ['b']]"]
+    assert factory_threads and factory_threads[0] != threading.get_ident()
+
+
+def test_two_senders_query_simultaneously(tmp_path):
+    import threading
+
+    from agent.backend import SqliteBackend
+
+    path = _sqlite_db(tmp_path)
+    barrier = threading.Barrier(2, timeout=10)
+
+    def factory():
+        return SqliteBackend(path)
+
+    def make_answer(session):
+        backend = session["backend"]
+
+        def answer(history, question, ask_user):
+            barrier.wait()
+            rows = backend.run_sql("SELECT name FROM items ORDER BY id;")["rows"]
+            return f"{rows}"
+
+        return answer
+
+    server, client = _server(
+        factory=factory, timeout=30, allowed_numbers=frozenset({SENDER, OTHER})
+    )
+    server.make_answer = make_answer
+    assert _post(server, _payload(sender=SENDER, body="q", mid="wamid.s1")) == 200
+    assert _post(server, _payload(sender=OTHER, body="q", mid="wamid.o1")) == 200
+    assert _wait_until(lambda: len(client.bodies()) >= 2, timeout=10)
+    assert sorted(client.bodies()) == ["[['a'], ['b']]", "[['a'], ['b']]"]
+    by_sender = {}
+    with client.lock:
+        for to, body in client.sends:
+            by_sender[to] = body
+    assert by_sender == {SENDER: "[['a'], ['b']]", OTHER: "[['a'], ['b']]"}
+    server.close_sessions()
+
+
+def test_factory_failure_then_success(tmp_path):
+    from agent.backend import SqliteBackend
+
+    path = _sqlite_db(tmp_path)
+    attempts: list[int] = []
+
+    def factory():
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise RuntimeError("db down")
+        return SqliteBackend(path)
+
+    server, client = _server(factory=factory, timeout=30)
+    server.make_answer = lambda session: _db_answer(session)
+    assert _post(server, _payload(body="q", mid="wamid.f1")) == 200
+    assert _wait_until(lambda: len(client.bodies()) >= 1, timeout=10)
+    assert "Sorry" in client.bodies()[0]
+    assert _post(server, _payload(body="q", mid="wamid.f2")) == 200
+    assert _wait_until(lambda: len(client.bodies()) >= 2, timeout=10)
+    assert client.bodies()[1] == "['items']:[['a'], ['b']]"
+    assert len(attempts) == 2
+    server.close_sessions()
+
+
 def test_full_http_round_trip(monkeypatch):
     import urllib.error as urlerror
 
@@ -552,7 +666,7 @@ def test_full_http_round_trip(monkeypatch):
     probe.server_close()
     server, client = _server()
     calls: list = []
-    server.answer_fn = _answer("hello back", calls)
+    server.make_answer = lambda session: _answer("hello back", calls)
     thread = threading.Thread(
         target=server.serve, kwargs={"port": 0}, daemon=True
     )

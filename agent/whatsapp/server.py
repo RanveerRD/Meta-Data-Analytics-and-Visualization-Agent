@@ -69,13 +69,15 @@ class WhatsAppServer:
         self,
         config: WhatsAppConfig,
         client: WhatsAppClient,
-        answer_fn: Any,
+        make_answer: Any,
         clarify_timeout: float = 300.0,
+        backend_factory: Any = None,
     ) -> None:
         self.config = config
         self.client = client
-        self.answer_fn = answer_fn
+        self.make_answer = make_answer
         self.clarify_timeout = clarify_timeout
+        self.backend_factory = backend_factory
         self.sessions: dict[str, dict[str, Any]] = {}
         self.lock = threading.Lock()
         self.seen: deque[str] = deque(maxlen=_DEDUP_KEEP)
@@ -224,6 +226,12 @@ class WhatsAppServer:
 
         return ask
 
+    def _open_backend(self, session: dict[str, Any]) -> Any:
+        """Create the session backend in this worker thread. Never shared."""
+        backend = self.backend_factory()
+        session["backend"] = backend
+        return backend
+
     def _serve_sender(self, sender: str, session: dict[str, Any]) -> None:
         """One sender's turns, strictly one at a time, forever."""
         while True:
@@ -233,7 +241,10 @@ class WhatsAppServer:
                 continue
             snapshot = len(session["history"])
             try:
-                reply = self.answer_fn(
+                if self.backend_factory is not None and "backend" not in session:
+                    self._open_backend(session)
+                answer_fn = self.make_answer(session)
+                reply = answer_fn(
                     session["history"], body, self._asker(sender, session)
                 )
             except _Abandoned:
@@ -284,6 +295,20 @@ class WhatsAppServer:
             pass
         finally:
             self.httpd.server_close()
+            self.close_sessions()
+
+    def close_sessions(self) -> None:
+        """Defensively close every live session backend (shutdown path)."""
+        with self.lock:
+            sessions = list(self.sessions.values())
+        for session in sessions:
+            backend = session.pop("backend", None)
+            if backend is None:
+                continue
+            try:
+                backend.close()
+            except Exception:
+                log.exception("session backend close failed")
 
 
 class _WebhookHandler(BaseHTTPRequestHandler):
