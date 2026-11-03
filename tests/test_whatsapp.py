@@ -382,6 +382,96 @@ def test_oversize_body_rejected():
     assert calls == []
 
 
+def test_startup_line_and_logging():
+    import logging as std_logging
+
+    from agent.whatsapp.__main__ import (
+        HOST,
+        PORT,
+        _LOG_FORMAT,
+        configure_logging,
+        startup_line,
+    )
+
+    assert HOST == "127.0.0.1" and PORT == 8080
+    assert "asctime" in _LOG_FORMAT and "levelname" in _LOG_FORMAT
+    config = _config()
+    assert startup_line(config) == (
+        "WhatsApp webhook ready on 127.0.0.1:8080, "
+        "dataset=olist, 1 allowed number(s)"
+    )
+    root = std_logging.getLogger()
+    saved = root.handlers[:]
+    saved_level = root.level
+    try:
+        configure_logging()
+        installed = [
+            h for h in root.handlers
+            if isinstance(h, std_logging.StreamHandler)
+            and getattr(h.formatter, "_fmt", "") == _LOG_FORMAT
+        ]
+        assert installed
+        assert root.level <= std_logging.INFO
+    finally:
+        root.handlers = saved
+        root.level = saved_level
+
+
+def test_accepted_message_logs_short_id_only(tmp_path, caplog):
+    import logging as std_logging
+
+    caplog.set_level(std_logging.INFO, logger="agent.whatsapp.server")
+    server, client = _server()
+    server.answer_fn = _answer("ok")
+    assert _post(server, _payload(body="hello there")) == 200
+    assert _wait_until(lambda: len(client.bodies()) >= 1)
+    accepted = [
+        r for r in caplog.records if "accepted" in r.getMessage()
+    ]
+    assert len(accepted) == 1
+    assert accepted[0].getMessage() == "message from \u20264567 accepted"
+    assert SENDER not in accepted[0].getMessage()
+    assert "hello there" not in caplog.text
+    for secret in ("tok-abc", SECRET, "vt-123"):
+        assert secret not in caplog.text
+
+
+def test_handler_timeout_default():
+    from agent.whatsapp.server import _WebhookHandler
+
+    assert _WebhookHandler.timeout == 10
+
+
+def test_stalled_connection_closed(monkeypatch):
+    import socket as socket_mod
+
+    from agent.whatsapp.server import _WebhookHandler
+
+    try:
+        probe = HTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
+    except OSError:
+        pytest.skip("loopback unavailable")
+    probe.server_close()
+    monkeypatch.setattr(_WebhookHandler, "timeout", 0.5)
+    server, _client = _server()
+    thread = threading.Thread(
+        target=server.serve, kwargs={"port": 0}, daemon=True
+    )
+    thread.start()
+    try:
+        assert _wait_until(lambda: server.httpd is not None)
+        port = server.httpd.server_port
+        sock = socket_mod.create_connection(("127.0.0.1", port), timeout=5)
+        sock.settimeout(5)
+        try:
+            assert sock.recv(1) == b""
+        finally:
+            sock.close()
+    finally:
+        if server.httpd is not None:
+            server.httpd.shutdown()
+
+
 def test_format_turn_result():
     submission = {"answer": "x"}
     fake = type("R", (), {"text": "A\nChart: workspace/charts/a.png\nChart note: n\nB", "verification": "verification: 1 matched", "submission": submission})()

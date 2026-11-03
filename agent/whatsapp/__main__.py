@@ -2,12 +2,33 @@
 
 from __future__ import annotations
 
+import logging
+import sys
+
 from agent.__main__ import _base_instructions, _instructions_for_question
 from agent.datasets import REGISTRY
 from agent.loop import REPO_ROOT, answer_question, build_client  # noqa: F401
 from agent.whatsapp.client import WhatsAppClient
 from agent.whatsapp.config import ConfigError, load_config
 from agent.whatsapp.server import WhatsAppServer, format_turn_result
+
+HOST = "127.0.0.1"
+PORT = 8080
+_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+
+
+def configure_logging() -> None:
+    """INFO to stderr with timestamp and level."""
+    logging.basicConfig(level=logging.INFO, stream=sys.stderr, format=_LOG_FORMAT, force=True)
+
+
+def startup_line(config) -> str:
+    """One startup line; kept exact by the startup test."""
+    count = len(config.allowed_numbers)
+    return (
+        f"WhatsApp webhook ready on {HOST}:{PORT}, "
+        f"dataset={config.dataset}, {count} allowed number(s)"
+    )
 
 
 def main() -> int:
@@ -16,6 +37,7 @@ def main() -> int:
     except ConfigError as exc:
         print(f"error: {exc}")
         return 2
+    configure_logging()
     try:
         client, model = build_client()
     except RuntimeError as exc:
@@ -47,7 +69,8 @@ def main() -> int:
         )
         return format_turn_result(result)
 
-    WhatsAppServer(config, wa_client, answer).serve()
+    print(startup_line(config))
+    WhatsAppServer(config, wa_client, answer).serve(HOST, PORT)
     backend.close()
     return 0
 

@@ -132,6 +132,7 @@ class WhatsAppServer:
                     self.sessions[sender] = session
                     session["worker"].start()
                 session["inbox"].put((time.monotonic(), mid, body))
+                log.info("message from %s accepted", _short(sender))
         return 200
 
     # -- internals --
@@ -251,6 +252,7 @@ class WhatsAppServer:
 
     # -- HTTP routing (thin wrappers; logic stays unit-testable) --
 
+
     def dispatch_get(self, path: str, query: str) -> tuple[int, str, str]:
         """Route a GET: (status, content-type, body)."""
         if path != "/webhook":
@@ -272,46 +274,9 @@ class WhatsAppServer:
 
     def serve(self, host: str = "127.0.0.1", port: int = 8080) -> None:
         """Bind loopback and serve until interrupted."""
-
-        outer = self
-
-        class Handler(BaseHTTPRequestHandler):
-            server_version = "WhatsAppAgent/1"
-
-            def _reply(self, status: int, content_type: str, body: str) -> None:
-                raw = body.encode("utf-8")
-                self.send_response(status)
-                self.send_header("Content-Type", content_type)
-                self.send_header("Content-Length", str(len(raw)))
-                self.end_headers()
-                self.wfile.write(raw)
-
-            def do_GET(self) -> None:
-                parsed = urlparse(self.path)
-                status, content_type, body = outer.dispatch_get(
-                    parsed.path, parsed.query
-                )
-                self._reply(status, content_type, body)
-
-            def do_POST(self) -> None:
-                try:
-                    length = int(self.headers.get("Content-Length") or 0)
-                except ValueError:
-                    length = 0
-                raw = self.rfile.read(length) if 0 < length <= _MAX_BODY else b""
-                status, content_type, body = outer.dispatch_post(
-                    urlparse(self.path).path,
-                    length,
-                    raw,
-                    self.headers.get("X-Hub-Signature-256"),
-                )
-                self._reply(status, content_type, body)
-
-            def log_message(self, *args: object) -> None:
-                log.info("%s %s", self.command, self.path.split("?")[0])
-
-        self.httpd = ThreadingHTTPServer((host, port), Handler)
+        self.httpd = ThreadingHTTPServer((host, port), _WebhookHandler)
         self.httpd.daemon_threads = True
+        self.httpd.app = self  # type: ignore[attr-defined]
         log.info("WhatsApp webhook listening on %s:%d", host, port)
         try:
             self.httpd.serve_forever()
@@ -319,3 +284,46 @@ class WhatsAppServer:
             pass
         finally:
             self.httpd.server_close()
+
+
+class _WebhookHandler(BaseHTTPRequestHandler):
+    """One request per connection; a stalled peer cannot hold a thread."""
+
+    server_version = "WhatsAppAgent/1"
+    timeout = 10
+
+    @property
+    def app(self) -> "WhatsAppServer":
+        return self.server.app  # type: ignore[attr-defined,no-any-return]
+
+    def _reply(self, status: int, content_type: str, body: str) -> None:
+        raw = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        status, content_type, body = self.app.dispatch_get(
+            parsed.path, parsed.query
+        )
+        self._reply(status, content_type, body)
+
+    def do_POST(self) -> None:
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        raw = self.rfile.read(length) if 0 < length <= _MAX_BODY else b""
+        status, content_type, body = self.app.dispatch_post(
+            urlparse(self.path).path,
+            length,
+            raw,
+            self.headers.get("X-Hub-Signature-256"),
+        )
+        self._reply(status, content_type, body)
+
+    def log_message(self, *args: object) -> None:
+        log.info("%s %s", self.command, self.path.split("?")[0])
