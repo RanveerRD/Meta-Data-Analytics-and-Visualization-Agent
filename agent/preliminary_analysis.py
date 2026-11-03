@@ -20,9 +20,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from agent.datasets import REGISTRY
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MEMORY_DIR = REPO_ROOT / "workspace" / "memory"
-DEFAULT_DATASET = "olist"
+DEFAULT_DATASET = next(iter(REGISTRY))
 
 KINDS = ("definition", "quirk")
 STATUSES = ("proposed", "approved", "rejected", "retired")

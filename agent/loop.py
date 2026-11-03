@@ -79,6 +79,7 @@ class TurnResult:
     record_path: str | None = None
     verification: str | None = None
     clarification: dict[str, Any] | None = None
+    submission: dict[str, Any] | None = None
 
 
 @dataclass
@@ -434,4 +435,5 @@ def answer_question(
         record_path=record_path,
         verification=verification,
         clarification=clarification,
+        submission=submission,
     )

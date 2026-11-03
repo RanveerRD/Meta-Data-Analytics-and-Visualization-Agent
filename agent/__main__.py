@@ -5,9 +5,8 @@ from __future__ import annotations
 import argparse
 from functools import partial
 
-from agent.backend import SqliteBackend
+from agent.datasets import REGISTRY
 from agent.loop import REPO_ROOT, answer_question, build_client
-from agent.pg_backend import PostgresBackend
 from agent.preliminary_analysis import (
     DEFAULT_DATASET,
     MEMORY_DIR,
@@ -15,17 +14,15 @@ from agent.preliminary_analysis import (
     approve_definition,
 )
 
-DATASETS = ("olist", "adventureworks")
-
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse console flags; --dataset picks the database and memory store."""
     parser = argparse.ArgumentParser(description="Ask questions about a dataset.")
     parser.add_argument(
         "--dataset",
-        choices=DATASETS,
-        default="olist",
-        help="which dataset to query (default: olist)",
+        choices=[*REGISTRY, "all"],
+        default=next(iter(REGISTRY)),
+        help="which dataset to query (default: first registry entry)",
     )
     return parser.parse_args(argv)
 
@@ -201,18 +198,106 @@ def _review_proposed_notes(dataset: str = DEFAULT_DATASET) -> None:
 
 def _backend_for_dataset(dataset: str):
     """Connect to the chosen dataset; fail fast with a clear error."""
-    if dataset == "adventureworks":
-        return PostgresBackend()
-    return SqliteBackend(REPO_ROOT / "data" / "olist.sqlite")
+    return REGISTRY[dataset]["make_backend"]()
 
 
-_BANNERS = {
-    "olist": ("Ask about the Olist database. Empty line exits.", "olist> "),
-    "adventureworks": (
-        "Ask about the AdventureWorks database. Empty line exits.",
-        "adventureworks> ",
-    ),
-}
+def _banner_and_prompt(dataset: str) -> tuple[str, str]:
+    """Banner and prompt label derived from the registry entry."""
+    entry = REGISTRY[dataset]
+    return (
+        f"Ask about the {entry['label']} database. Empty line exits.",
+        entry["prompt"],
+    )
+
+
+def _all_banner() -> str:
+    labels = [entry["label"] for entry in REGISTRY.values()]
+    return f"Ask across {' and '.join(labels)}. Empty line exits."
+
+
+def _instructions_for_dataset(name: str, backend) -> str:
+    """Full per-question instructions for one dataset worker."""
+    instructions = _base_instructions(backend.dialect)
+    if backend.dialect_notes:
+        instructions += "\n\nDialect notes:\n" + backend.dialect_notes
+    section = DefinitionStore.load(name).build_prompt_section()
+    if section:
+        instructions += "\n\n" + section
+    return instructions
+
+
+def _render_all_outcome(outcome: dict) -> None:
+    """Print the merged reply, then each worker's rendered answer."""
+    print(f"routing: {', '.join(outcome['routing'])}")
+    if outcome["merged"]:
+        print("\nCombined:\n" + outcome["merged"])
+    elif outcome["verification"]["status"] == "fallback":
+        print(
+            "\nUNVERIFIED NUMBERS: "
+            + ", ".join(outcome["verification"]["unmatched"])
+        )
+    else:
+        print("\nNote: answers shown separately; no combined reply recorded.")
+    for worker in outcome["workers"]:
+        print(f"\n[{worker['dataset']}]")
+        if worker["answer"] is None:
+            if worker.get("partial_summary"):
+                print(worker["partial_summary"])
+            else:
+                print(worker.get("note", "No accepted submission."))
+            continue
+        print(worker["answer"])
+    if outcome["failed"]:
+        print(
+            "\nNote: no accepted answer from: "
+            + ", ".join(outcome["failed"])
+            + "; their numbers are excluded."
+        )
+    print(f"\ntokens: {outcome['total_tokens']} total")
+    for path in outcome["record_paths"]:
+        print(f"Record: {path}")
+    print(f"Orchestration: {outcome['orchestration_path']}")
+
+
+def _run_all_mode() -> int:
+    """Ask one question across every dataset via the orchestrator."""
+    from agent.orchestrator import run_cross_dataset_question
+
+    datasets: dict = {}
+    try:
+        for name, entry in REGISTRY.items():
+            backend = entry["make_backend"]()
+            datasets[name] = {
+                "description": entry["description"],
+                "backend": backend,
+                "instructions": _instructions_for_dataset(name, backend),
+            }
+    except RuntimeError as exc:
+        print(f"error: {exc}")
+        return 2
+    print(_all_banner())
+    try:
+        while True:
+            try:
+                question = input("all> ")
+            except EOFError:
+                break
+            if not question.strip():
+                break
+            if question.strip().startswith("/"):
+                names = " or ".join(REGISTRY)
+                print(f"Use --dataset {names} for saved definitions.")
+                continue
+            try:
+                outcome = run_cross_dataset_question(question, datasets)
+            except RuntimeError as exc:
+                print(f"error: {exc}")
+                continue
+            _render_all_outcome(outcome)
+    finally:
+        for info in datasets.values():
+            info["backend"].close()
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -223,6 +308,8 @@ def main(argv: list[str] | None = None) -> int:
     except RuntimeError as exc:
         print(f"error: {exc}")
         return 2
+    if dataset == "all":
+        return _run_all_mode()
     try:
         backend = _backend_for_dataset(dataset)
     except RuntimeError as exc:
@@ -233,7 +320,7 @@ def main(argv: list[str] | None = None) -> int:
     except RuntimeError as exc:
         print(f"error: {exc}")
         return 2
-    banner, prompt_label = _BANNERS[dataset]
+    banner, prompt_label = _banner_and_prompt(dataset)
     save = partial(approve_definition, dataset=dataset)
     history: list = []
     print(banner)
