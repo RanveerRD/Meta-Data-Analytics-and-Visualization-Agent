@@ -23,9 +23,19 @@ class BIConnector(Protocol):
     requires_approval: bool
 
     def publish(
-        self, sql: str, title: str, chart_type: str, x: str, y: str
+        self,
+        sql: str,
+        title: str,
+        chart_type: str,
+        x: str,
+        y: str,
+        x_values: list[str] | None = None,
     ) -> PublishResult:
-        """Return the link for this SQL. No network, no writes."""
+        """Return the link for this SQL. No network, no writes.
+
+        x_values carries the plotted x labels when the caller has them;
+        connectors use them only for display decisions, never as data.
+        """
         ...
 
 

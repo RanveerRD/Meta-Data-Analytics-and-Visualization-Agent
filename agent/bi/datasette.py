@@ -21,9 +21,16 @@ class DatasetteConnector:
         self.database = database
 
     def publish(
-        self, sql: str, title: str, chart_type: str, x: str, y: str
+        self,
+        sql: str,
+        title: str,
+        chart_type: str,
+        x: str,
+        y: str,
+        x_values: list[str] | None = None,
     ) -> PublishResult:
         _ = title
+        _ = x_values
         if chart_type not in ("bar", "line"):
             raise ValueError('chart_type must be "bar" or "line".')
         base = os.environ.get(_BASE_ENV, _DEFAULT_BASE).rstrip("/")

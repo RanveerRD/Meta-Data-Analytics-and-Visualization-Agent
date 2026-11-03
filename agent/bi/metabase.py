@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import urllib.error
 import urllib.request
@@ -22,6 +23,7 @@ _URL_ENV = "METABASE_URL"
 _KEY_ENV = "METABASE_API_KEY"
 _DEFAULT_BASE = "http://localhost:3000"
 _TIMEOUT_S = 10
+_YEARLIKE_RE = re.compile(r"^(\d{4})$")
 
 
 class _Redirected(Exception):
@@ -132,7 +134,13 @@ class MetabaseConnector:
         )
 
     def publish(
-        self, sql: str, title: str, chart_type: str, x: str, y: str
+        self,
+        sql: str,
+        title: str,
+        chart_type: str,
+        x: str,
+        y: str,
+        x_values: list[str] | None = None,
     ) -> PublishResult:
         """Save the exact recorded SQL as a Metabase question."""
         if chart_type not in ("bar", "line"):
@@ -141,6 +149,22 @@ class MetabaseConnector:
         key = self._key()
         database_id = self._database_id(base, key)
         name = f"Agent: {title}"
+        viz: dict[str, object] = {
+            "graph.dimensions": [x],
+            "graph.metrics": [y],
+        }
+        if x_values and all(
+            _YEARLIKE_RE.match(v) and 1900 <= int(v) <= 2100 for v in x_values
+        ):
+            # Best effort, cosmetic only: show year-like x without a
+            # thousands separator. Visualization settings are stored
+            # opaquely and ignored when unknown, so a wrong value here
+            # cannot make Metabase reject the card.
+            viz["column_settings"] = {
+                json.dumps(["name", x], separators=(",", ":")): {
+                    "number_separators": "."
+                }
+            }
         body = {
             "name": name,
             "dataset_query": {
@@ -149,10 +173,7 @@ class MetabaseConnector:
                 "native": {"query": sql},
             },
             "display": chart_type,
-            "visualization_settings": {
-                "graph.dimensions": [x],
-                "graph.metrics": [y],
-            },
+            "visualization_settings": viz,
             "collection_id": None,
         }
         _status, text = self._call(base, key, "POST", f"{base}/api/card", body)

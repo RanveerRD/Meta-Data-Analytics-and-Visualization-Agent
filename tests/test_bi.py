@@ -394,6 +394,80 @@ def test_requires_approval_flags():
     assert MetabaseConnector.requires_approval is True
 
 
+def _metabase_routes(card_id=42):
+    return {
+        ("GET", "/api/database"): (200, json.dumps([{"id": 3, "name": "adventureworks"}])),
+        ("POST", "/api/card"): (200, json.dumps({"id": card_id})),
+    }
+
+
+def _post_body(fake):
+    return json.loads(next(r for r in fake.requests if r["method"] == "POST")["body"])
+
+
+def _post_bodies(fake):
+    return [json.loads(r["body"]) for r in fake.requests if r["method"] == "POST"]
+
+
+def test_publish_line_override_on_date(tmp_path, capsys, monkeypatch):
+    rows = [[f"2016-{m:02d}", float(m)] for m in (1, 2, 3)]
+    with _FakeMetabase(_metabase_routes()) as fake:
+        _metabase_env(monkeypatch, fake.base)
+        pending = _rows_pending(tmp_path, "date?", ("month", "revenue"), rows, 1.0)
+        assert pending["candidates"][0]["type"] == "line"
+        monkeypatch.setattr("builtins.input", lambda _: "y")
+        assert _handle_command("/publish 1 bar", dataset="adventureworks",
+                               pending_charts=pending) is True
+        assert _handle_command("/publish 1", dataset="adventureworks",
+                               pending_charts=pending) is True
+        assert [b["display"] for b in _post_bodies(fake)] == ["bar", "line"]
+
+
+def test_publish_line_on_category_refused(tmp_path, capsys, monkeypatch):
+    with _FakeMetabase(_metabase_routes()) as fake:
+        _metabase_env(monkeypatch, fake.base)
+        pending = _adventure_pending(tmp_path)
+        assert _handle_command("/publish 1 line", dataset="adventureworks",
+                               pending_charts=pending) is True
+        out = capsys.readouterr().out
+        assert "use bar instead" in out
+        assert [r for r in fake.requests if r["method"] == "POST"] == []
+
+
+def test_publish_junk_token_usage(tmp_path, capsys):
+    pending = _adventure_pending(tmp_path)
+    assert _handle_command("/publish 1 pie", dataset="adventureworks",
+                           pending_charts=pending) is True
+    assert "usage: /publish [n] [bar|line]" in capsys.readouterr().out
+
+
+def test_publish_year_like_x_has_no_grouping(tmp_path, capsys, monkeypatch):
+    rows = [["2015", 1.0], ["2016", 2.0], ["2017", 3.0]]
+    with _FakeMetabase(_metabase_routes()) as fake:
+        _metabase_env(monkeypatch, fake.base)
+        pending = _rows_pending(tmp_path, "yr?", ("year", "revenue"), rows, 1.0)
+        monkeypatch.setattr("builtins.input", lambda _: "y")
+        assert _handle_command("/publish 1", dataset="adventureworks",
+                               pending_charts=pending) is True
+        viz = _post_body(fake)["visualization_settings"]
+        assert viz["column_settings"] == {
+            '["name","year"]': {"number_separators": "."}
+        }
+
+
+def test_publish_plain_numeric_x_has_no_column_settings(
+    tmp_path, capsys, monkeypatch
+):
+    rows = [[5, 1.0], [6, 2.0], [7, 3.0]]
+    with _FakeMetabase(_metabase_routes()) as fake:
+        _metabase_env(monkeypatch, fake.base)
+        pending = _rows_pending(tmp_path, "n?", ("n", "revenue"), rows, 1.0)
+        monkeypatch.setattr("builtins.input", lambda _: "y")
+        assert _handle_command("/publish 1", dataset="adventureworks",
+                               pending_charts=pending) is True
+        assert "column_settings" not in _post_body(fake)["visualization_settings"]
+
+
 def _adventure_pending(tmp_path):
     record = AnalysisRecord.create("adv?", tmp_path / "runs")
     record.set_checklist(
@@ -407,6 +481,22 @@ def _adventure_pending(tmp_path):
          "row_count": 2, "truncated": False},
     )
     record.record_finding("rev", "big", qid, 1.0)
+    return {"record_abs": record.path, "sqlite_path": None,
+            "candidates": chart_candidates(record)}
+
+
+def _rows_pending(tmp_path, name, columns, rows, value):
+    record = AnalysisRecord.create(name, tmp_path / "runs")
+    record.set_checklist(
+        [{"id": "rev", "question": "Revenue?", "evidence_needed": "sum"}]
+    )
+    record.plan_action([{"item_id": "rev", "steps": ["sum"]}])
+    qid = record.record_query(
+        f"SELECT {columns[0]}, {columns[1]} FROM t",
+        {"columns": list(columns), "rows": [list(r) for r in rows],
+         "row_count": len(rows), "truncated": False},
+    )
+    record.record_finding("rev", "big", qid, value)
     return {"record_abs": record.path, "sqlite_path": None,
             "candidates": chart_candidates(record)}
 

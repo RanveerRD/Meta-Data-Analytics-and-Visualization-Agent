@@ -61,25 +61,51 @@ def _print_datasets(current: str) -> None:
     print("Run with --dataset <name> or --dataset all")
 
 
-def _run_chart_command(line: str, pending: dict | None) -> bool:
-    """Draw a console-offered candidate with no model call. Always handled."""
-    from agent.tools.make_chart import _is_date_series, render_stored_chart
-
-    if not pending or not pending["candidates"]:
-        print("No chart available for the last answer.")
-        return True
-    parts = line.split()
+def _parse_n_and_type(tokens: list[str], usage: str) -> tuple[Any, str | None]:
+    """Parse '[n] [bar|line]' args shared by /chart and /publish."""
     number: Any = 1
     override: str | None = None
-    for token in parts[1:]:
+    for token in tokens:
         if token in ("bar", "line"):
             override = token
         else:
             try:
                 number = int(token)
             except ValueError:
-                print("usage: /chart [n] [bar|line]")
-                return True
+                print(usage)
+                return None, None
+    return number, override
+
+
+def _candidate_x_labels(record: Any, candidate: dict) -> list[str]:
+    """X labels of the candidate's plottable rows, reloaded from the record."""
+    query = next((q for q in record.queries if q["id"] == candidate["query_id"]), None)
+    columns = list(query.get("columns", [])) if query else []
+    xi = columns.index(candidate["x"]) if candidate["x"] in columns else -1
+    yi = columns.index(candidate["y"]) if candidate["y"] in columns else -1
+    if not query or xi < 0 or yi < 0:
+        return []
+    return [str(r[xi]) for r in query["rows"] if r[yi] is not None]
+
+
+def _line_allowed(record: Any, candidate: dict) -> bool:
+    """A line needs date-like x with at least 3 plottable rows."""
+    from agent.tools.make_chart import _is_date_series
+
+    labels = _candidate_x_labels(record, candidate)
+    return len(labels) >= 3 and _is_date_series(labels)
+
+
+def _run_chart_command(line: str, pending: dict | None) -> bool:
+    """Draw a console-offered candidate with no model call. Always handled."""
+    from agent.tools.make_chart import render_stored_chart
+
+    if not pending or not pending["candidates"]:
+        print("No chart available for the last answer.")
+        return True
+    number, override = _parse_n_and_type(line.split()[1:], "usage: /chart [n] [bar|line]")
+    if number is None:
+        return True
     candidates = pending["candidates"]
     if not 1 <= number <= len(candidates):
         print(f"choose 1 to {len(candidates)}")
@@ -90,24 +116,12 @@ def _run_chart_command(line: str, pending: dict | None) -> bool:
         print("usage: /chart [n] [bar|line]")
         return True
     record = AnalysisRecord.load(pending["record_abs"])
-    if chart_type == "line":
-        query = next(
-            (q for q in record.queries if q["id"] == candidate["query_id"]), None
+    if chart_type == "line" and not _line_allowed(record, candidate):
+        print(
+            "line needs date-like x values (YYYY-MM-DD, YYYY-MM or YYYY) "
+            "with at least 3 rows; use bar instead."
         )
-        columns = list(query.get("columns", [])) if query else []
-        xi = columns.index(candidate["x"]) if candidate["x"] in columns else -1
-        yi = columns.index(candidate["y"]) if candidate["y"] in columns else -1
-        labels = (
-            [str(r[xi]) for r in query["rows"] if r[yi] is not None]
-            if query and xi >= 0 and yi >= 0
-            else []
-        )
-        if len(labels) < 3 or not _is_date_series(labels):
-            print(
-                "line needs date-like x values (YYYY-MM-DD, YYYY-MM or YYYY) "
-                "with at least 3 rows; use bar instead."
-            )
-            return True
+        return True
     result = render_stored_chart(record, candidate, chart_type)
     if "error" in result:
         print(f"error: {result['error']}")
@@ -133,7 +147,7 @@ def _handle_command(
         print("/forget <key> - retire the approved note for a key")
         print("/datasets - list available datasets")
         print("/chart [n] [bar|line] - draw an offered chart for the last answer")
-        print("/publish [n] - share an offered chart as a BI link")
+        print("/publish [n] [bar|line] - share an offered chart as a BI link")
         print("/help - show this list")
         return True
     if line == "/chart" or line.startswith("/chart "):
@@ -198,18 +212,22 @@ def _run_publish_command(line: str, pending: dict | None, dataset: str) -> bool:
     if bi is None:
         print(f"No BI connector configured for {dataset}")
         return True
-    number = 1
-    for token in line.split()[1:]:
-        try:
-            number = int(token)
-        except ValueError:
-            print("usage: /publish [n]")
-            return True
+    number, override = _parse_n_and_type(line.split()[1:], "usage: /publish [n] [bar|line]")
+    if number is None:
+        return True
     candidates = pending["candidates"]
     if not 1 <= number <= len(candidates):
         print(f"choose 1 to {len(candidates)}")
         return True
     candidate = candidates[number - 1]
+    chart_type = override or candidate["type"]
+    record = AnalysisRecord.load(pending["record_abs"])
+    if chart_type == "line" and not _line_allowed(record, candidate):
+        print(
+            "line needs date-like x values (YYYY-MM-DD, YYYY-MM or YYYY) "
+            "with at least 3 rows; use bar instead."
+        )
+        return True
     connector_cls = CONNECTORS[bi["connector"]]
     if connector_cls.requires_approval:
         name = f"Agent: {_code_title(candidate['x'], candidate['y'])}"
@@ -226,14 +244,14 @@ def _run_publish_command(line: str, pending: dict | None, dataset: str) -> bool:
         result = connector.publish(
             candidate["sql"],
             _code_title(candidate["x"], candidate["y"]),
-            candidate["type"],
+            chart_type,
             candidate["x"],
             candidate["y"],
+            x_values=_candidate_x_labels(record, candidate),
         )
     except (ValueError, RuntimeError) as exc:
         print(f"error: {exc}")
         return True
-    record = AnalysisRecord.load(pending["record_abs"])
     record.note_publish(bi["connector"], candidate["query_id"], result.url)
     print(result.url)
     if bi["connector"] == "datasette" and pending.get("sqlite_path"):
