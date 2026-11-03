@@ -50,6 +50,7 @@ def test_registry_lists_all_tools():
         "ask_clarification",
         "get_schema",
         "list_tables",
+        "make_chart",
         "plan_action",
         "propose_note",
         "record_finding",
@@ -281,7 +282,7 @@ def _check_schema_shape(schema: dict, path: str) -> None:
 
 
 def test_all_tool_schemas_list_every_property_as_required():
-    assert len(TOOL_SCHEMAS) == 9
+    assert len(TOOL_SCHEMAS) == 10
     for schema in TOOL_SCHEMAS:
         _check_schema_shape(schema, schema["name"])
 

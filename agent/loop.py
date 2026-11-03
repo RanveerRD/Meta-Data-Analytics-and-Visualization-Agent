@@ -15,7 +15,7 @@ from typing import Any
 from openai import OpenAI
 
 from agent.backend import DatabaseBackend
-from agent.tools import TOOL_SCHEMAS, ToolContext, dispatch
+from agent.tools import ToolContext, dispatch, schemas_for
 
 MODEL_DEFAULT = "muse-spark-1.3-contributor"
 BASE_URL = "https://api.meta.ai/v1"
@@ -80,6 +80,7 @@ class TurnResult:
     verification: str | None = None
     clarification: dict[str, Any] | None = None
     submission: dict[str, Any] | None = None
+    charts: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -130,6 +131,8 @@ def _summarize(name: str, result: str) -> str:
     if data.get("ok"):
         status = f" ({data['status']})" if "status" in data else ""
         return f"{name}: ok{status}"
+    if "path" in data and "points" in data:
+        return f"{name}: {data['points']} points -> {data['path']}"
     return str(result)[:100]
 
 
@@ -169,12 +172,15 @@ def _render_decision(
 
 
 def render_answer(
-    submission: dict[str, Any], clarifications: list[dict[str, Any]]
+    submission: dict[str, Any],
+    clarifications: list[dict[str, Any]],
+    charts: list[str] | None = None,
 ) -> str:
     """Render the accepted answer with its decisions and gaps.
 
     The Gaps section is always present; with no gaps found it reads
-    "- none found".
+    "- none found". Chart lines are appended by code after acceptance,
+    so chart paths never pass through number extraction.
     """
     lines = [submission["answer"], "", "Decisions:"]
     lines.extend(
@@ -193,6 +199,8 @@ def render_answer(
     else:
         lines.append("- none found")
     lines.extend(["", EVIDENCE_QUESTION])
+    for path in charts or []:
+        lines.append(f"Chart: {path}")
     return "\n".join(lines)
 
 
@@ -262,7 +270,7 @@ def _round(
         response = client.responses.create(
             model=model,
             instructions=instructions,
-            tools=TOOL_SCHEMAS,
+            tools=schemas_for(ctx),
             input=history,
         )
     except Exception as exc:
@@ -322,6 +330,7 @@ def answer_question(
     runs_dir: Path = RUNS_DIR,
     ask_user: Any = None,
     dataset: str = "olist",
+    allow_charts: bool = True,
 ) -> TurnResult:
     """Ask one question, keeping shared history.
 
@@ -334,6 +343,7 @@ def answer_question(
         runs_dir=runs_dir,
         ask_user=ask_user,
         dataset=dataset,
+        allow_charts=allow_charts,
     )
     history.append({"role": "user", "content": question})
     snapshot = len(history) - 1
@@ -409,9 +419,10 @@ def answer_question(
             clarification=clarification,
         )
     verification: str | None = None
+    chart_paths = [c["path"] for c in ctx.record.charts] if ctx.record is not None else []
     if ctx.record is not None:
         if submission is not None:
-            text = render_answer(submission, ctx.record.clarifications)
+            text = render_answer(submission, ctx.record.clarifications, chart_paths)
             verification = (
                 f"verification: {len(submission['matched'])} numbers matched, "
                 f"{len(submission['unmatched'])} unmatched"
@@ -436,4 +447,5 @@ def answer_question(
         verification=verification,
         clarification=clarification,
         submission=submission,
+        charts=chart_paths,
     )

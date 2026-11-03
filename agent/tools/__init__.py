@@ -33,6 +33,7 @@ class ToolContext:
     memory_dir: Path | None = None
     ask_user: Any = None
     dataset: str = "olist"
+    allow_charts: bool = True
 
 
 def _tool_modules() -> tuple:
@@ -40,6 +41,7 @@ def _tool_modules() -> tuple:
         ask_clarification,
         get_schema,
         list_tables,
+        make_chart,
         plan_action,
         propose_note,
         record_finding,
@@ -57,6 +59,7 @@ def _tool_modules() -> tuple:
         ask_clarification,
         record_finding,
         run_sql,
+        make_chart,
         submit_answer,
     )
 
@@ -67,8 +70,17 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [m.SCHEMA for m in _TOOL_MODULES]
 _HANDLERS = {m.NAME: m.run for m in _TOOL_MODULES}
 
 
+def schemas_for(ctx: ToolContext) -> list[dict[str, Any]]:
+    """Schemas offered to this turn; make_chart is single-dataset only."""
+    if ctx.allow_charts:
+        return TOOL_SCHEMAS
+    return [m.SCHEMA for m in _TOOL_MODULES if m.NAME != "make_chart"]
+
+
 def dispatch(ctx: ToolContext, name: str, args: dict[str, Any]) -> str:
     """Run the named tool and return its JSON result string."""
+    if name == "make_chart" and not ctx.allow_charts:
+        return json.dumps({"error": "make_chart is not available in cross-dataset mode"})
     try:
         handler = _HANDLERS[name]
     except KeyError:

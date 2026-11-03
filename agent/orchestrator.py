@@ -239,6 +239,7 @@ def run_cross_dataset_question(
             question,
             ask_user=_scoped_ask_user,
             dataset=name,
+            allow_charts=False,
         )
         capped = result.submission is None and CAP_MESSAGE in (result.text or "")
         workers.append(

@@ -370,6 +370,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         if result.text:
             print(result.text)
+        for path in result.charts:
+            print(f"chart saved: {path}")
         if result.usage_known:
             print(
                 f"tokens: {result.input_tokens} in / "

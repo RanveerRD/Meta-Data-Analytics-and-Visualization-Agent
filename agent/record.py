@@ -168,6 +168,39 @@ class AnalysisRecord:
         return copy.deepcopy(self._state["findings"])
 
     @property
+    def charts(self) -> list[dict[str, Any]]:
+        return copy.deepcopy(self._state.get("charts", []))
+
+    def record_chart(
+        self,
+        query_id: str,
+        chart_type: str,
+        x_column: str,
+        y_column: str,
+        title: str,
+        path: str,
+        points: int,
+        skipped: int,
+    ) -> dict[str, Any]:
+        """Store a chart made from a recorded query; return its entry."""
+        entry = {
+            "id": f"c{len(self._state.get('charts', [])) + 1}",
+            "query_id": query_id,
+            "chart_type": chart_type,
+            "x_column": x_column,
+            "y_column": y_column,
+            "title": title,
+            "path": path,
+            "points": points,
+            "skipped": skipped,
+            "timestamp": _utc_now_iso(),
+        }
+        self._state.setdefault("charts", []).append(entry)
+        self._append_audit("record_chart", {"id": entry["id"], "path": path})
+        self.save()
+        return copy.deepcopy(entry)
+
+    @property
     def rejected(self) -> list[dict[str, Any]]:
         return copy.deepcopy(self._state.get("rejected", []))
 
@@ -502,6 +535,7 @@ class AnalysisRecord:
             "clarification_calls": self._state.get("clarification_calls", 0),
             "submission": self._state.get("submission"),
             "rejections": self._state.get("rejections", 0),
+            "charts": self._state.get("charts", []),
             "audit": self._state["audit"],
         }
 
@@ -551,5 +585,6 @@ def _blank_state(question: str) -> dict[str, Any]:
         "clarification_calls": 0,
         "submission": None,
         "rejections": 0,
+        "charts": [],
         "audit": [],
     }
