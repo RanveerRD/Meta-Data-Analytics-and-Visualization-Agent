@@ -21,6 +21,8 @@ from agent.tools.make_chart import (  # noqa: E402
     _display_path,
     _missing_periods,
     _render_figure,
+    chart_candidates,
+    render_stored_chart,
 )
 
 ROWS = [["SP", 498440.43], ["RJ", 12.345], ["MG", 100.0]]
@@ -345,6 +347,101 @@ def test_long_gap_caps_at_six_periods(tmp_path):
     note = ctx.record.charts[0]["note"]
     assert note.startswith("no data for 2016-02, 2016-03, 2016-04, 2016-05, 2016-06, 2016-07")
     assert note.endswith("and 2 more (not drawn)")
+
+
+def test_candidate_needs_two_rows(tmp_path):
+    ctx, _qid = _chart_ctx(tmp_path, rows=[["only", 1.0]])
+    assert chart_candidates(ctx.record) == []
+
+
+def test_candidate_needs_finding(tmp_path):
+    ctx, _qid = _chart_ctx(tmp_path, with_finding=False)
+    assert chart_candidates(ctx.record) == []
+
+
+def test_candidate_skips_truncated(tmp_path):
+    ctx, _qid = _chart_ctx(tmp_path, truncated=True)
+    assert chart_candidates(ctx.record) == []
+
+
+def test_candidate_skips_fifty_one_rows(tmp_path):
+    rows = [[f"r{i}", float(i)] for i in range(51)]
+    ctx, _qid = _chart_ctx(tmp_path, rows=rows)
+    assert chart_candidates(ctx.record) == []
+
+
+def test_candidate_skips_ambiguous_y(tmp_path):
+    rows = [["a", 10.0, 10.0], ["b", 20.0, 20.0]]
+    ctx, _qid = _chart_ctx(
+        tmp_path, rows=rows, columns=("region", "rev1", "rev2")
+    )
+    assert chart_candidates(ctx.record) == []
+
+
+def test_candidate_date_x_line_and_two_rows_bar(tmp_path):
+    rows = [[f"2016-{m:02d}", float(m)] for m in (1, 2, 3)]
+    ctx, _qid = _chart_ctx(tmp_path, rows=rows, columns=("month", "revenue"))
+    (candidate,) = chart_candidates(ctx.record)
+    assert candidate["type"] == "line"
+    ctx2, _qid2 = _chart_ctx(
+        tmp_path, rows=rows[:2], columns=("month", "revenue")
+    )
+    (candidate2,) = chart_candidates(ctx2.record)
+    assert candidate2["type"] == "bar"
+
+
+def test_candidate_category_x_bar_and_sql(tmp_path):
+    ctx, qid = _chart_ctx(tmp_path)
+    (candidate,) = chart_candidates(ctx.record)
+    assert candidate == {
+        "query_id": qid,
+        "x": "region",
+        "y": "revenue",
+        "type": "bar",
+        "points": 3,
+        "sql": "SELECT region, revenue FROM t",
+    }
+
+
+def test_candidate_tries_every_finding(tmp_path):
+    ctx, qid = _chart_ctx(tmp_path, with_finding=False)
+    ctx.record.record_finding("rev", "top region is SP", qid, "SP")
+    ctx.record.record_finding("rev", "revenue is big", qid, 498440.43)
+    (candidate,) = chart_candidates(ctx.record)
+    assert candidate["query_id"] == qid
+    assert candidate["y"] == "revenue"
+
+
+def test_candidates_capped_at_three_in_finding_order(tmp_path):
+    runs = tmp_path / "runs"
+    record = AnalysisRecord.create("many?", runs)
+    record.set_checklist(
+        [{"id": "rev", "question": "Revenue?", "evidence_needed": "sums"}]
+    )
+    record.plan_action([{"item_id": "rev", "steps": ["sum"]}])
+    for i in range(4):
+        qid = record.record_query(
+            f"SELECT region, revenue FROM t{i}",
+            {"columns": ["region", "revenue"],
+             "rows": [["a", float(i)], ["b", float(i + 1)]],
+             "row_count": 2, "truncated": False},
+        )
+        record.record_finding("rev", f"finding {i}", qid, float(i))
+    candidates = chart_candidates(record)
+    assert [c["query_id"] for c in candidates] == ["q1", "q2", "q3"]
+    assert all(c["sql"].startswith("SELECT region, revenue FROM t") for c in candidates)
+
+
+def test_render_stored_chart_draws_and_records(tmp_path):
+    ctx, qid = _chart_ctx(tmp_path)
+    (candidate,) = chart_candidates(ctx.record)
+    result = render_stored_chart(ctx.record, candidate, "bar")
+    assert result["ok"] is True
+    assert Path(result["path"]).read_bytes()[:4] == b"\x89PNG"
+    (entry,) = ctx.record.charts
+    assert entry["title"] == "revenue by region"
+    assert entry["query_id"] == qid
+    assert any(e["action"] == "record_chart" for e in ctx.record.audit)
 
 
 def test_render_chart_line_never_verified():

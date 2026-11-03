@@ -83,6 +83,7 @@ def _display_path(path: str | Path) -> str:
 
 _MONTH_RE = re.compile(r"^(\d{4})-(0[1-9]|1[0-2])$")
 _YEAR_RE = re.compile(r"^(\d{4})$")
+_DAY_RE = re.compile(r"^(\d{4})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$")
 
 
 def _month_index(year: int, month: int) -> int:
@@ -122,9 +123,10 @@ def _gaps(idxs: list[int], fmt: Any) -> list[str]:
 
 
 def _is_date_series(x_labels: list[str]) -> bool:
-    """True when every x is monthly (YYYY-MM) or every x is yearly (YYYY)."""
+    """True when every x is daily, monthly or yearly."""
     return bool(x_labels) and (
-        all(_MONTH_RE.match(x) for x in x_labels)
+        all(_DAY_RE.match(x) for x in x_labels)
+        or all(_MONTH_RE.match(x) for x in x_labels)
         or all(_YEAR_RE.match(x) for x in x_labels)
     )
 
@@ -307,6 +309,223 @@ def _render_figure(
     return fig, ax
 
 
+_TOLERANCE = 0.005
+
+
+def _as_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float, Decimal)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip().replace(",", ""))
+        except ValueError:
+            return None
+    return None
+
+
+def _numeric_columns(query: dict[str, Any]) -> list[str]:
+    """Columns whose non-None values are all numbers (bools excluded)."""
+    found = []
+    columns = list(query.get("columns", []))
+    for i, name in enumerate(columns):
+        cells = [row[i] for row in query.get("rows", []) if row[i] is not None]
+        if cells and all(
+            isinstance(c, (int, float, Decimal)) and not isinstance(c, bool)
+            for c in cells
+        ):
+            found.append(name)
+    return found
+
+
+def _find_y_column(query: dict[str, Any], value: Any) -> str | None:
+    """The single numeric column containing the finding value, if exactly one."""
+    target = _as_float(value)
+    if target is None:
+        return None
+    matches = []
+    columns = list(query.get("columns", []))
+    for i, name in enumerate(columns):
+        cells = [row[i] for row in query.get("rows", []) if row[i] is not None]
+        if not cells or name not in _numeric_columns(query):
+            continue
+        if any(abs(float(c) - target) <= _TOLERANCE for c in cells):
+            matches.append(name)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _build_points(
+    query: dict[str, Any], x_column: str, y_column: str
+) -> tuple[list[tuple[str, float]], int] | str:
+    """Shared validation for make_chart and candidate detection.
+
+    Returns (points, skipped-Nones) or an error string with what to fix.
+    """
+    qid = query.get("id", "?")
+    columns = list(query.get("columns", []))
+    for key, name in (("x_column", x_column), ("y_column", y_column)):
+        if name not in columns:
+            return (
+                f"{key} {name!r} is not a column of {qid}; "
+                f"choose from: {', '.join(columns)}."
+            )
+    xi = columns.index(x_column)
+    yi = columns.index(y_column)
+    points: list[tuple[str, float]] = []
+    skipped = 0
+    for row in query.get("rows", []):
+        raw_y = row[yi]
+        if raw_y is None:
+            skipped += 1
+            continue
+        if isinstance(raw_y, bool) or not isinstance(raw_y, (int, float, Decimal)):
+            return (
+                f"y column {y_column!r} has a non-numeric value "
+                f"{raw_y!r}; chart a numeric column instead."
+            )
+        points.append((str(row[xi]), float(raw_y)))
+    if not (_MIN_POINTS <= len(points) <= _MAX_POINTS):
+        return (
+            f"query {qid!r} gives {len(points)} plottable points; "
+            "need 2 to 50. Aggregate or LIMIT in SQL and chart the new query."
+        )
+    return points, skipped
+
+
+def chart_candidates(record: Any) -> list[dict[str, Any]]:
+    """Chartable queries behind this record's findings, in finding order.
+
+    A query qualifies only if some finding cites it, it was not truncated,
+    and one of its findings' values matches exactly one numeric column
+    (text-valued findings never disqualify it). At most 3, each carrying
+    its exact recorded SQL for a later step.
+    """
+    if record is None:
+        return []
+    ordered: list[str] = []
+    for finding in record.findings:
+        qid = finding.get("query_id")
+        if qid not in ordered:
+            ordered.append(qid)
+    queries = {q["id"]: q for q in record.queries}
+    out: list[dict[str, Any]] = []
+    for qid in ordered:
+        query = queries.get(qid)
+        if query is None or query.get("truncated"):
+            continue
+        columns = list(query.get("columns", []))
+        if not columns:
+            continue
+        y_column = None
+        for finding in record.findings:
+            if finding.get("query_id") != qid:
+                continue
+            y_column = _find_y_column(query, finding.get("value"))
+            if y_column is not None:
+                break
+        if y_column is None:
+            continue
+        built = _build_points(query, columns[0], y_column)
+        if isinstance(built, str):
+            continue
+        points, _skipped = built
+        if len({label for label, _ in points}) < 2:
+            continue
+        ctype = (
+            "line"
+            if _is_date_series([label for label, _ in points]) and len(points) >= 3
+            else "bar"
+        )
+        out.append(
+            {
+                "query_id": qid,
+                "x": columns[0],
+                "y": y_column,
+                "type": ctype,
+                "points": len(points),
+                "sql": query.get("sql", ""),
+            }
+        )
+        if len(out) == 3:
+            break
+    return out
+
+
+def _code_title(x_column: str, y_column: str) -> str:
+    """Code-built title: '<y> by <x>', no numbers, underscores as spaces."""
+
+    def clean(name: str) -> str:
+        return re.sub(r"\s+", " ", re.sub(r"[0-9]+", "", name.replace("_", " "))).strip()
+
+    return f"{clean(y_column)} by {clean(x_column)}"
+
+
+def _draw_and_record(
+    record: Any,
+    query_id: str,
+    chart_type: str,
+    x_column: str,
+    y_column: str,
+    title: str,
+    points: list[tuple[str, float]],
+    skipped: int,
+) -> dict[str, Any]:
+    """Render, save under the record's charts dir, and record the chart."""
+    raw_labels = [label for label, _ in points]
+    values = [value for _, value in points]
+    missing = _missing_periods(raw_labels)
+    note = _chart_note(missing) if missing else ""
+    plot_labels, plot_values = _fill_gaps(raw_labels, values, missing)
+    charts_dir = record.path.parent.parent.parent / "charts"
+    charts_dir.mkdir(parents=True, exist_ok=True)
+    number = len(record.charts) + 1
+    out = charts_dir / f"{record.run_id}-{number}.png"
+    try:
+        fig, ax = _render_figure(
+            plot_labels, plot_values, chart_type, title, x_column, y_column
+        )
+        fig.savefig(out, dpi=150)
+    finally:
+        plt.close("all")
+    return record.record_chart(
+        query_id, chart_type, x_column, y_column,
+        title, _display_path(out), len(points), skipped, note,
+    )
+
+
+def render_stored_chart(
+    record: Any, candidate: dict[str, Any], chart_type: str
+) -> dict[str, Any]:
+    """Draw a console-offered candidate; rows are reloaded from the record."""
+    query = next(
+        (q for q in record.queries if q["id"] == candidate["query_id"]), None
+    )
+    if query is None:
+        return {"error": f"query {candidate['query_id']!r} is not in the saved record."}
+    built = _build_points(query, candidate["x"], candidate["y"])
+    if isinstance(built, str):
+        return {"error": built}
+    points, skipped = built
+    title = _code_title(candidate["x"], candidate["y"])
+    entry = _draw_and_record(
+        record, candidate["query_id"], chart_type,
+        candidate["x"], candidate["y"], title, points, skipped,
+    )
+    description = (
+        f"{chart_type} chart of {candidate['y']} by {candidate['x']}, "
+        f"{len(points)} points"
+        + (f" ({skipped} empty rows skipped)" if skipped else "")
+    )
+    return {
+        "ok": True,
+        "path": entry["path"],
+        "description": description,
+        "points": len(points),
+        "chart_id": entry["id"],
+    }
+
+
 def run(ctx: Any, args: dict[str, Any]) -> str:
     record = ctx.record
     if record is None:
@@ -336,59 +555,18 @@ def run(ctx: Any, args: dict[str, Any]) -> str:
     chart_type = args["chart_type"]
     if chart_type not in ("bar", "line"):
         return _refuse('chart_type must be "bar" or "line".')
-    columns = list(query.get("columns", []))
-    for key in ("x_column", "y_column"):
-        if args[key] not in columns:
-            return _refuse(
-                f"{key} {args[key]!r} is not a column of {query_id}; "
-                f"choose from: {', '.join(columns)}."
-            )
-    xi = columns.index(args["x_column"])
-    yi = columns.index(args["y_column"])
-    points: list[tuple[str, float]] = []
-    skipped = 0
-    for row in query.get("rows", []):
-        raw_y = row[yi]
-        if raw_y is None:
-            skipped += 1
-            continue
-        if isinstance(raw_y, bool) or not isinstance(raw_y, (int, float, Decimal)):
-            return _refuse(
-                f"y column {args['y_column']!r} has a non-numeric value "
-                f"{raw_y!r}; chart a numeric column instead."
-            )
-        points.append((str(row[xi]), float(raw_y)))
-    if not (_MIN_POINTS <= len(points) <= _MAX_POINTS):
-        return _refuse(
-            f"query {query_id!r} gives {len(points)} plottable points; "
-            "need 2 to 50. Aggregate or LIMIT in SQL and chart the new query."
-        )
+    built = _build_points(query, args["x_column"], args["y_column"])
+    if isinstance(built, str):
+        return _refuse(built)
+    points, skipped = built
     cells = [v for row in query.get("rows", []) for v in row]
     title_error = _check_title(args["title"], cells, len(points))
     if title_error is not None:
         return _refuse(title_error)
 
-    charts_dir = Path(ctx.runs_dir).parent / "charts"
-    charts_dir.mkdir(parents=True, exist_ok=True)
-    number = len(record.charts) + 1
-    out = charts_dir / f"{record.run_id}-{number}.png"
-
-    raw_labels = [label for label, _ in points]
-    values = [value for _, value in points]
-    missing = _missing_periods(raw_labels)
-    note = _chart_note(missing) if missing else ""
-    plot_labels, plot_values = _fill_gaps(raw_labels, values, missing)
-    try:
-        fig, ax = _render_figure(
-            plot_labels, plot_values, chart_type,
-            args["title"], args["x_column"], args["y_column"],
-        )
-        fig.savefig(out, dpi=150)
-    finally:
-        plt.close("all")
-    entry = record.record_chart(
-        query_id, chart_type, args["x_column"], args["y_column"],
-        args["title"], _display_path(out), len(points), skipped, note,
+    entry = _draw_and_record(
+        record, query_id, chart_type, args["x_column"], args["y_column"],
+        args["title"], points, skipped,
     )
     description = (
         f"{chart_type} chart of {args['y_column']} by {args['x_column']}, "

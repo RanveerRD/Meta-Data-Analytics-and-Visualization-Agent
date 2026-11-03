@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 from functools import partial
+from typing import Any
 
 from agent.datasets import REGISTRY
 from agent.loop import REPO_ROOT, answer_question, build_client
+from agent.record import AnalysisRecord
 from agent.preliminary_analysis import (
     DEFAULT_DATASET,
     MEMORY_DIR,
@@ -58,8 +60,66 @@ def _print_datasets(current: str) -> None:
     print("Run with --dataset <name> or --dataset all")
 
 
+def _run_chart_command(line: str, pending: dict | None) -> bool:
+    """Draw a console-offered candidate with no model call. Always handled."""
+    from agent.tools.make_chart import _is_date_series, render_stored_chart
+
+    if not pending or not pending["candidates"]:
+        print("No chart available for the last answer.")
+        return True
+    parts = line.split()
+    number: Any = 1
+    override: str | None = None
+    for token in parts[1:]:
+        if token in ("bar", "line"):
+            override = token
+        else:
+            try:
+                number = int(token)
+            except ValueError:
+                print("usage: /chart [n] [bar|line]")
+                return True
+    candidates = pending["candidates"]
+    if not 1 <= number <= len(candidates):
+        print(f"choose 1 to {len(candidates)}")
+        return True
+    candidate = candidates[number - 1]
+    chart_type = override or candidate["type"]
+    if chart_type not in ("bar", "line"):
+        print("usage: /chart [n] [bar|line]")
+        return True
+    record = AnalysisRecord.load(pending["record_abs"])
+    if chart_type == "line":
+        query = next(
+            (q for q in record.queries if q["id"] == candidate["query_id"]), None
+        )
+        columns = list(query.get("columns", [])) if query else []
+        xi = columns.index(candidate["x"]) if candidate["x"] in columns else -1
+        yi = columns.index(candidate["y"]) if candidate["y"] in columns else -1
+        labels = (
+            [str(r[xi]) for r in query["rows"] if r[yi] is not None]
+            if query and xi >= 0 and yi >= 0
+            else []
+        )
+        if len(labels) < 3 or not _is_date_series(labels):
+            print(
+                "line needs date-like x values (YYYY-MM-DD, YYYY-MM or YYYY) "
+                "with at least 3 rows; use bar instead."
+            )
+            return True
+    result = render_stored_chart(record, candidate, chart_type)
+    if "error" in result:
+        print(f"error: {result['error']}")
+    else:
+        print(f"chart saved: {result['path']}")
+    return True
+
+
 def _handle_command(
-    line: str, memory_dir=MEMORY_DIR, dataset: str = DEFAULT_DATASET
+    line: str,
+    memory_dir=MEMORY_DIR,
+    dataset: str = DEFAULT_DATASET,
+    pending_charts: dict | None = None,
 ) -> bool:
     """Run a / command. Returns True when the line was a command."""
     if not line.startswith("/"):
@@ -71,8 +131,11 @@ def _handle_command(
         print("/notes - list approved notes")
         print("/forget <key> - retire the approved note for a key")
         print("/datasets - list available datasets")
+        print("/chart [n] [bar|line] - draw an offered chart for the last answer")
         print("/help - show this list")
         return True
+    if line == "/chart" or line.startswith("/chart "):
+        return _run_chart_command(line, pending_charts)
     if line == "/notes":
         approved = DefinitionStore.load(dataset, memory_dir).approved_entries()
         if not approved:
@@ -99,6 +162,18 @@ def _print_new_charts(text: str, charts: list[str]) -> None:
     for path in charts:
         if path not in text:
             print(f"chart saved: {path}")
+
+
+def _offer_charts(candidates: list[dict], drawn: list[str]) -> None:
+    """Print one offer line per candidate. No model call, no tokens."""
+    drawn_ids = set(drawn)
+    for i, candidate in enumerate(candidates, 1):
+        suffix = " (already drawn)" if candidate["query_id"] in drawn_ids else ""
+        print(
+            f"Chart available: {i}. {candidate['type']} chart of "
+            f"{candidate['y']} by {candidate['x']} "
+            f"({candidate['points']} points). Type /chart {i}{suffix}"
+        )
 
 
 def _format_evidence(value: object) -> str:
@@ -357,6 +432,7 @@ def main(argv: list[str] | None = None) -> int:
     banner, prompt_label = _banner_and_prompt(dataset)
     save = partial(approve_definition, dataset=dataset)
     history: list = []
+    pending_charts: dict | None = None
     print(banner)
     while True:
         try:
@@ -365,8 +441,11 @@ def main(argv: list[str] | None = None) -> int:
             break
         if not question.strip():
             break
-        if _handle_command(question.strip(), dataset=dataset):
+        if _handle_command(
+            question.strip(), dataset=dataset, pending_charts=pending_charts
+        ):
             continue
+        pending_charts = None
         instructions = _instructions_for_question(
             base_instructions, dataset, backend.dialect_notes
         )
@@ -378,6 +457,12 @@ def main(argv: list[str] | None = None) -> int:
         if result.text:
             print(result.text)
         _print_new_charts(result.text, result.charts)
+        if result.chart_candidates and result.record_path:
+            pending_charts = {
+                "record_abs": REPO_ROOT / result.record_path,
+                "candidates": result.chart_candidates,
+            }
+            _offer_charts(result.chart_candidates, result.chart_drawn)
         if result.usage_known:
             print(
                 f"tokens: {result.input_tokens} in / "
