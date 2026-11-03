@@ -215,6 +215,7 @@ def test_workers_run_in_mapping_order_with_scope(_tmp_run_dirs):
         assert s["instructions"].startswith(f"INSTRUCTIONS-{s['dataset']}")
         assert f"Scope: use only the {s['dataset']} data:" in s["instructions"]
         assert "not tables inside this one" in s["instructions"]
+        assert "Do not mention other databases in Gaps" in s["instructions"]
     assert outcome["merged"] == "Bee total is 10. Ay total is 20. Cee total is 30."
     assert outcome["verification"] == {"status": "verified", "unmatched": []}
 

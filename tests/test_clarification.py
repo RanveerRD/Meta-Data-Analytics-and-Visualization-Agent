@@ -471,7 +471,7 @@ def test_instructions_require_asking_every_time():
     assert "after the last clarification is answered" in text.lower()
     for key in ("revenue", "top_metric", "order_status", "year_date", "cost", "period"):
         assert key in text
-    assert "more than one candidate column, table or definition" in text
+    assert "every column or table that could represent it" in text
     assert "counts as stating it" in text
     assert "only_option is only for a list of distinct values" in text
     assert "FIRST, before computing any figure" in text

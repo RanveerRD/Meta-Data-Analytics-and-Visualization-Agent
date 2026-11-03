@@ -218,6 +218,7 @@ def run_cross_dataset_question(
             f"Scope: use only the {name} data: {info['description']}. "
             "Answer the part of the question this database can answer, "
             "and say in Gaps what it cannot. "
+            "Do not mention other databases in Gaps; another worker answers them. "
             "The user may be asking across several databases. References to "
             "'each dataset' or 'each database' mean the databases the user "
             "has connected, not tables inside this one; answer for this "
