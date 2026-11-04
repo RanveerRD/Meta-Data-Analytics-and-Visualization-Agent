@@ -12,6 +12,7 @@ import hmac
 import json
 import logging
 import queue
+import string
 import threading
 import time
 from collections import deque
@@ -36,6 +37,19 @@ _IMAGE_FAILURE_LINE = "I drew the chart but could not send the image."
 _DIGIT_REPLY = (
     "That number isn't answering anything right now. Please ask your question."
 )
+_DATASET_PHRASES = frozenset(
+    {
+        "change dataset",
+        "switch dataset",
+        "change database",
+        "switch database",
+        "dataset",
+        "datasets",
+    }
+)
+_FILLER_WORDS = frozenset({"to", "the", "dataset", "database", "use"})
+_SWITCH_VERBS = ("switch", "change", "use")
+_TRIGGER_WORDS = frozenset({"switch", "change", "use", "dataset", "database", "datasets"})
 _FAILURE_LINE = "Sorry \u2014 I couldn't finish that question. Please try again."
 
 
@@ -287,6 +301,67 @@ class WhatsAppServer:
             return names[index - 1]
         return None
 
+    @staticmethod
+    def _normalize_command(text: str) -> str:
+        """Lowercase, collapse whitespace, drop trailing punctuation."""
+        return " ".join(text.strip().lower().split()).rstrip(string.punctuation).strip()
+
+    @staticmethod
+    def _normalize_identifier(value: str) -> str:
+        """Compare names ignoring case, spaces and hyphens."""
+        return value.lower().replace(" ", "").replace("-", "")
+
+    def _resolve_dataset(self, candidate: str) -> str | None:
+        """Registry key for a normalized identifier or 1-based number."""
+        names = list(self.datasets)
+        if candidate.isdigit():
+            index = int(candidate) - 1
+            return names[index] if 0 <= index < len(names) else None
+        for name in names:
+            label = str(self.datasets[name].get("label", ""))
+            if candidate and (
+                candidate == self._normalize_identifier(name)
+                or candidate == self._normalize_identifier(label)
+            ):
+                return name
+        return None
+
+    def _match_dataset_command(self, text: str) -> tuple[str | None, str | None]:
+        """Classify a whole message as a dataset command.
+
+        Returns ("picker", None) for /dataset and the plain phrases,
+        ("switch", name) for /dataset <id> and phrase-plus-name forms, and
+        (None, None) for everything else. Whole-message match only: a longer
+        question that merely contains a dataset word is never a command.
+        """
+        norm = self._normalize_command(text)
+        if norm in _DATASET_PHRASES:
+            return ("picker", None)
+        if norm == "/dataset" or norm.startswith("/dataset "):
+            arg = norm[len("/dataset") :].strip()
+            if not arg:
+                return ("picker", None)
+            name = self._resolve_dataset(self._normalize_identifier(arg))
+            return ("switch", name) if name is not None else ("picker", None)
+        tokens = norm.split()
+        trigger = any(token in _TRIGGER_WORDS for token in tokens)
+        core = [token for token in tokens if token not in _FILLER_WORDS]
+        had_verb = False
+        while core and core[0] in _SWITCH_VERBS:
+            core.pop(0)
+            had_verb = True
+        candidate = self._normalize_identifier(" ".join(core))
+        if not candidate:
+            return ("picker", None) if trigger else (None, None)
+        if candidate.isdigit() and not trigger:
+            return (None, None)
+        name = self._resolve_dataset(candidate)
+        if name is not None:
+            return ("switch", name)
+        # Unknown target after a switch verb falls back to the picker; a
+        # question that merely mentions dataset words is left alone.
+        return ("picker", None) if had_verb else (None, None)
+
     def _await_pick(
         self, session: dict[str, Any], sender: str, asked_at: float, held: bool
     ) -> str | None:
@@ -310,7 +385,13 @@ class WhatsAppServer:
             if arrived < asked_at:
                 session["overtake"].append((arrived, _mid, body))
                 continue
-            if body.strip() == "/dataset" or body.strip().startswith("/dataset "):
+            kind = None
+            pick_name = None
+            if self.default_dataset is None:
+                kind, pick_name = self._match_dataset_command(body)
+            if kind == "switch" and pick_name is not None:
+                return pick_name
+            if kind == "picker" or body.strip() == "/dataset" or body.strip().startswith("/dataset "):
                 asked_at = time.monotonic()
                 deadline = asked_at + self.clarify_timeout
                 retries = 0
@@ -338,6 +419,27 @@ class WhatsAppServer:
         session["dataset"] = name
         return name
 
+    def _confirmation(self, label: str) -> str:
+        """Post-pick line; the switch hint only exists in ask mode."""
+        text = f"Using {label}. Ask your question."
+        if self.default_dataset is None:
+            text += " Send /dataset to switch."
+        return text
+
+    def _switch_dataset(self, session: dict[str, Any], sender: str, name: str) -> None:
+        """Direct switch: same reset as /dataset but no picker; confirm."""
+        backend = session.pop("backend", None)
+        if backend is not None:
+            try:
+                backend.close()
+            except Exception:
+                log.exception("session backend close failed for %s", _short(sender))
+        session.pop("dataset", None)
+        session["history"].clear()
+        session["dataset"] = name
+        label = self.datasets[name]["label"]
+        self._send(sender, self._confirmation(label))
+
     def _reset_dataset(self, session: dict[str, Any], sender: str) -> None:
         """Clear dataset, backend, history and instructions; show the picker."""
         backend = session.pop("backend", None)
@@ -363,7 +465,7 @@ class WhatsAppServer:
                 if name is not None:
                     session["dataset"] = name
                     label = self.datasets[name]["label"]
-                    self._send(sender, f"Using {label}. Ask your question.")
+                    self._send(sender, self._confirmation(label))
                 continue
             _ts, _mid, body = self._next_message(session)
             text = body.strip()
@@ -378,6 +480,14 @@ class WhatsAppServer:
                 # digit handler, so digits fall through to it.
                 self._send(sender, _DIGIT_REPLY)
                 continue
+            if self.default_dataset is None:
+                kind, switch_name = self._match_dataset_command(text)
+                if kind == "switch" and switch_name is not None:
+                    self._switch_dataset(session, sender, switch_name)
+                    continue
+                if kind == "picker":
+                    self._reset_dataset(session, sender)
+                    continue
             if text == "/dataset" or text.startswith("/dataset "):
                 self._reset_dataset(session, sender)
                 continue

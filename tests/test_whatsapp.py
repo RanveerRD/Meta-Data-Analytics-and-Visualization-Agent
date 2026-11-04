@@ -842,7 +842,7 @@ def test_dataset_command_repicks_and_closes(tmp_path):
     assert closed == [True]
     assert _post(server, _payload(body="2", mid="wamid.d4")) == 200
     assert _wait_until(lambda: len(client.bodies()) >= 4)
-    assert client.bodies()[3] == "Using Zed. Ask your question."
+    assert client.bodies()[3] == "Using Zed. Ask your question. Send /dataset to switch."
     assert _post(server, _payload(body="q2", mid="wamid.d5")) == 200
     assert _wait_until(lambda: len(client.bodies()) >= 5)
     assert [s["dataset"] for s in seen] == ["olist", "zz"]
@@ -1195,6 +1195,131 @@ def test_digit_first_message_still_reaches_picker(tmp_path):
         lambda: any(b.startswith("Which dataset?") for b in client.bodies())
     )
     assert not any("isn't answering anything" in b for b in client.bodies())
+
+
+def _ask_server(tmp_path):
+    """Ask-mode server on olist(real temp SQLite)/zz(sentinel) with answers."""
+    datasets, factory, made, closed, real = _picker_setup(tmp_path)
+    seen: list = []
+    server, client = _server(datasets=datasets, default_dataset=None, factory=factory)
+    server.make_answer = _ds_answer(seen)
+    return server, client, seen, made, closed
+
+
+def _pick_first(server, client, seen):
+    assert _post(server, _payload(body="q", mid="wamid.k0")) == 200
+    assert _wait_until(
+        lambda: any(b.startswith("Which dataset?") for b in client.bodies())
+    )
+    assert _post(server, _payload(body="1", mid="wamid.k1")) == 200
+    assert _wait_until(lambda: seen and seen[0]["dataset"] == "olist")
+
+
+def test_phrases_trigger_picker(tmp_path):
+    server, client, seen, made, closed = _ask_server(tmp_path)
+    _pick_first(server, client, seen)
+    phrases = [
+        "change dataset",
+        "Switch Dataset",
+        "  change   database? ",
+        "dataset",
+        "datasets",
+        "switch database",
+        "CHANGE DATABASE!",
+    ]
+    for i, phrase in enumerate(phrases):
+        assert _post(server, _payload(body=phrase, mid=f"wamid.pp{i}a")) == 200
+        assert _wait_until(
+            lambda: sum(b.startswith("Which dataset?") for b in client.bodies())
+            >= i + 2
+        )
+        assert _post(server, _payload(body="1", mid=f"wamid.pp{i}b")) == 200
+        assert _wait_until(
+            lambda: client.bodies()[-1].startswith("Using Olist.")
+        )
+    assert client.bodies()[-1] == (
+        "Using Olist. Ask your question. Send /dataset to switch."
+    )
+    assert [s["question"] for s in seen] == ["q"]
+
+
+def test_dataset_questions_reach_agent(tmp_path):
+    server, client, seen, made, closed = _ask_server(tmp_path)
+    _pick_first(server, client, seen)
+    questions = [
+        "which dataset has more orders?",
+        "how many orders per dataset",
+        "how many orders in olist?",
+    ]
+    for i, question in enumerate(questions):
+        assert _post(server, _payload(body=question, mid=f"wamid.qq{i}")) == 200
+        assert _wait_until(lambda: len(seen) >= i + 2)
+    assert [s["question"] for s in seen] == ["q"] + questions
+    assert sum(b.startswith("Which dataset?") for b in client.bodies()) == 1
+
+
+def test_phrases_fixed_mode_reach_agent():
+    server, client = _server()
+    calls: list = []
+    server.make_answer = lambda session: _answer("ok", calls)
+    assert _post(server, _payload(body="change dataset", mid="wamid.fx1")) == 200
+    assert _post(server, _payload(body="olist", mid="wamid.fx2")) == 200
+    assert _wait_until(lambda: client.bodies() == ["ok", "ok"])
+    assert calls == ["change dataset", "olist"]
+
+
+def test_direct_switch_forms(tmp_path):
+    server, client, seen, made, closed = _ask_server(tmp_path)
+    _pick_first(server, client, seen)
+    cases = [
+        ("switch to Zed", "Using Zed. Ask your question. Send /dataset to switch."),
+        ("use olist", "Using Olist. Ask your question. Send /dataset to switch."),
+        ("ZED", "Using Zed. Ask your question. Send /dataset to switch."),
+        ("/dataset 1", "Using Olist. Ask your question. Send /dataset to switch."),
+        ("switch to 2", "Using Zed. Ask your question. Send /dataset to switch."),
+        ("change to zed.", "Using Zed. Ask your question. Send /dataset to switch."),
+        ("  USE   OLIST  ", "Using Olist. Ask your question. Send /dataset to switch."),
+    ]
+    for i, (message, confirmation) in enumerate(cases):
+        assert _post(server, _payload(body=message, mid=f"wamid.sw{i}")) == 200
+        assert _wait_until(lambda: client.bodies()[-1] == confirmation)
+    assert sum(b.startswith("Which dataset?") for b in client.bodies()) == 1
+    assert _post(server, _payload(body="q2", mid="wamid.swq")) == 200
+    assert _wait_until(lambda: len(seen) == 2)
+    assert [s["dataset"] for s in seen] == ["olist", "olist"]
+    assert [s["hist_len"] for s in seen] == [0, 0]
+    assert closed == [True]
+    assert made == {"olist": 2}
+
+
+def test_unknown_name_falls_back_to_picker(tmp_path):
+    server, client, seen, made, closed = _ask_server(tmp_path)
+    _pick_first(server, client, seen)
+    assert _post(server, _payload(body="/dataset xyz", mid="wamid.ux1")) == 200
+    assert _wait_until(
+        lambda: sum(b.startswith("Which dataset?") for b in client.bodies()) >= 2
+    )
+    assert _post(server, _payload(body="2", mid="wamid.ux2")) == 200
+    assert _wait_until(lambda: client.bodies()[-1].startswith("Using Zed."))
+    assert _post(server, _payload(body="switch to nowhere", mid="wamid.ux3")) == 200
+    assert _wait_until(
+        lambda: sum(b.startswith("Which dataset?") for b in client.bodies()) >= 3
+    )
+    assert _post(server, _payload(body="1", mid="wamid.ux4")) == 200
+    assert _wait_until(lambda: client.bodies()[-1].startswith("Using Olist."))
+    assert [s["question"] for s in seen] == ["q"]
+
+
+def test_fixed_mode_confirmation_has_no_hint():
+    server, client = _server()
+    server.make_answer = lambda session: _answer("ok")
+    assert _post(server, _payload(body="/dataset", mid="wamid.fh1")) == 200
+    assert _wait_until(
+        lambda: any(b.startswith("Which dataset?") for b in client.bodies())
+    )
+    assert _post(server, _payload(body="1", mid="wamid.fh2")) == 200
+    assert _wait_until(lambda: len(client.bodies()) >= 2)
+    assert client.bodies()[1] == "Using Olist. Ask your question."
 
 
 def test_digit_guard_replies_without_model_turn():
