@@ -28,10 +28,10 @@ PROVIDERS = ("meta", "baseten")
 
 # Baseten list-price estimate (USD per 1M tokens). Easy to correct; never
 # presented as anything but an estimate, and never used for Meta.
-BASENTEN_PRICE_AS_OF = "4 Nov 2026"
-BASENTEN_PRICE_INPUT_PER_M = 1.25
-BASENTEN_PRICE_CACHED_INPUT_PER_M = 0.15
-BASENTEN_PRICE_OUTPUT_PER_M = 4.25
+BASETEN_PRICE_AS_OF = "4 Nov 2026"
+BASETEN_PRICE_INPUT_PER_M = 1.25
+BASETEN_PRICE_CACHED_INPUT_PER_M = 0.15
+BASETEN_PRICE_OUTPUT_PER_M = 4.25
 
 
 def estimate_cost_usd(
@@ -40,9 +40,9 @@ def estimate_cost_usd(
     """Baseten list-price estimate. Output tokens already include reasoning."""
     uncached = max(prompt_tokens - cached_tokens, 0)
     return (
-        uncached * BASENTEN_PRICE_INPUT_PER_M
-        + cached_tokens * BASENTEN_PRICE_CACHED_INPUT_PER_M
-        + completion_tokens * BASENTEN_PRICE_OUTPUT_PER_M
+        uncached * BASETEN_PRICE_INPUT_PER_M
+        + cached_tokens * BASETEN_PRICE_CACHED_INPUT_PER_M
+        + completion_tokens * BASETEN_PRICE_OUTPUT_PER_M
     ) / 1_000_000
 
 
