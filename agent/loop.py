@@ -15,11 +15,9 @@ from typing import Any
 from openai import OpenAI
 
 from agent.backend import DatabaseBackend
+from agent.provider import chat_round
 from agent.tools import ToolContext, dispatch, schemas_for
 from agent.tools.make_chart import chart_candidates
-
-MODEL_DEFAULT = "muse-spark-1.3-contributor"
-BASE_URL = "https://api.meta.ai/v1"
 MAX_TURNS = 30
 REMINDER_TURNS = 3
 CAP_MESSAGE = f"Reached the {MAX_TURNS}-turn limit without a final answer."
@@ -52,22 +50,6 @@ def _read_env_file_value(name: str) -> str | None:
     return None
 
 
-def build_client() -> tuple[OpenAI, str]:
-    """Build the API client. Raises a clear error if the key is missing."""
-    api_key = os.environ.get("META_API_KEY") or _read_env_file_value("META_API_KEY")
-    if not api_key:
-        raise RuntimeError(
-            "META_API_KEY is missing: add it to .env as META_API_KEY=<key> "
-            "or export it in the environment. The key itself is never printed."
-        )
-    model = (
-        os.environ.get("META_MODEL")
-        or _read_env_file_value("META_MODEL")
-        or MODEL_DEFAULT
-    )
-    return OpenAI(base_url=BASE_URL, api_key=api_key), model
-
-
 @dataclass
 class TurnResult:
     """Everything one console turn needs to print."""
@@ -84,6 +66,7 @@ class TurnResult:
     charts: list[str] = field(default_factory=list)
     chart_notes: list[str] = field(default_factory=list)
     chart_titles: list[str] = field(default_factory=list)
+    cached_input_tokens: int = 0
     chart_candidates: list[dict[str, Any]] = field(default_factory=list)
     chart_drawn: list[str] = field(default_factory=list)
 
@@ -95,18 +78,8 @@ class _Usage:
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
+    cached_input_tokens: int = 0
     known: bool = True
-
-
-def _final_text(response: Any) -> str:
-    parts: list[str] = []
-    for item in getattr(response, "output", []):
-        if getattr(item, "type", None) != "message":
-            continue
-        for block in getattr(item, "content", []):
-            if getattr(block, "type", None) == "output_text":
-                parts.append(getattr(block, "text", ""))
-    return "".join(parts)
 
 
 def _short_args(args: dict[str, Any], limit: int = 120) -> str:
@@ -273,46 +246,48 @@ def _round(
     ctx: ToolContext,
     history: list[dict[str, Any]],
     usage: _Usage,
+    provider: str = "meta",
 ) -> tuple[str, bool, bool]:
     """One model call plus tool execution. Returns (text, had_calls, api_error)."""
     try:
-        response = client.responses.create(
-            model=model,
+        result = chat_round(
+            client,
+            model,
+            provider,
             instructions=instructions,
             tools=schemas_for(ctx),
-            input=history,
+            history=history,
         )
     except Exception as exc:
         print(f"api error: {type(exc).__name__}: {exc}")
         return "", False, True
-    response_usage = getattr(response, "usage", None)
-    if response_usage is None:
+    if not result.usage_known:
         usage.known = False
     else:
-        usage.input_tokens += getattr(response_usage, "input_tokens", 0) or 0
-        usage.output_tokens += getattr(response_usage, "output_tokens", 0) or 0
-        usage.total_tokens += getattr(response_usage, "total_tokens", 0) or 0
-    calls = [i for i in response.output if getattr(i, "type", None) == "function_call"]
-    for item in calls:
+        usage.input_tokens += result.input_tokens
+        usage.output_tokens += result.output_tokens
+        usage.total_tokens += result.total_tokens
+        usage.cached_input_tokens += result.cached_input_tokens
+    for call in result.calls:
         history.append(
             {
                 "type": "function_call",
-                "call_id": item.call_id,
-                "name": item.name,
-                "arguments": item.arguments,
+                "call_id": call["id"],
+                "name": call["name"],
+                "arguments": call["arguments"],
             }
         )
         try:
-            args = json.loads(item.arguments or "{}")
+            args = json.loads(call["arguments"] or "{}")
         except json.JSONDecodeError as exc:
             args = {}
-            result = json.dumps({"error": f"JSONDecodeError: {exc}"})
+            result_json = json.dumps({"error": f"JSONDecodeError: {exc}"})
         else:
-            print(f"  tool: {item.name}({_short_args(args)})")
-            result = dispatch(ctx, item.name, args)
-        print(f"    -> {_summarize(item.name, result)}")
+            print(f"  tool: {call['name']}({_short_args(args)})")
+            result_json = dispatch(ctx, call["name"], args)
+        print(f"    -> {_summarize(call['name'], result_json)}")
         try:
-            warning = json.loads(result).get("warning", "")
+            warning = json.loads(result_json).get("warning", "")
         except (json.JSONDecodeError, TypeError, AttributeError):
             warning = ""
         if isinstance(warning, str) and warning.startswith(
@@ -322,11 +297,11 @@ def _round(
         history.append(
             {
                 "type": "function_call_output",
-                "call_id": item.call_id,
-                "output": result,
+                "call_id": call["id"],
+                "output": result_json,
             }
         )
-    return _final_text(response), bool(calls), False
+    return result.text, bool(result.calls), False
 
 
 def answer_question(
@@ -340,6 +315,7 @@ def answer_question(
     ask_user: Any = None,
     dataset: str = "olist",
     allow_charts: bool = True,
+    provider: str = "meta",
 ) -> TurnResult:
     """Ask one question, keeping shared history.
 
@@ -373,7 +349,7 @@ def answer_question(
             ctx.record.clarification_calls if ctx.record is not None else 0
         )
         last_text, had_calls, api_error = _round(
-            client, model, instructions, ctx, history, usage
+            client, model, instructions, ctx, history, usage, provider
         )
         if api_error:
             del history[snapshot:]
@@ -399,7 +375,7 @@ def answer_question(
         history.append({"role": "user", "content": SUBMIT_REMINDER})
         for _ in range(REMINDER_TURNS):
             last_text, had_calls, api_error = _round(
-                client, model, instructions, ctx, history, usage
+                client, model, instructions, ctx, history, usage, provider
             )
             if api_error:
                 del history[snapshot:]
@@ -420,6 +396,7 @@ def answer_question(
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
             total_tokens=usage.total_tokens,
+            cached_input_tokens=usage.cached_input_tokens,
             usage_known=usage.known,
             record_path=record_path,
             verification="verification: no submitted answer"
@@ -466,6 +443,7 @@ def answer_question(
         input_tokens=usage.input_tokens,
         output_tokens=usage.output_tokens,
         total_tokens=usage.total_tokens,
+        cached_input_tokens=usage.cached_input_tokens,
         usage_known=usage.known,
         record_path=record_path,
         verification=verification,

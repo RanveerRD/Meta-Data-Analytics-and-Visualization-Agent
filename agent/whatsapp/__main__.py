@@ -8,7 +8,8 @@ from typing import Any
 
 from agent.__main__ import _base_instructions, _instructions_for_question
 from agent.datasets import REGISTRY
-from agent.loop import REPO_ROOT, answer_question, build_client  # noqa: F401
+from agent.loop import REPO_ROOT, answer_question  # noqa: F401
+from agent.provider import build_client
 from agent.whatsapp.client import WhatsAppClient
 from agent.whatsapp.config import ConfigError, load_config
 from agent.whatsapp.server import WhatsAppServer, format_turn_result
@@ -48,7 +49,7 @@ def main() -> int:
         return 2
     configure_logging()
     try:
-        client, model = build_client()
+        client, model, provider = build_client()
     except RuntimeError as exc:
         print(f"error: {exc}")
         return 2
@@ -87,6 +88,7 @@ def main() -> int:
                 question,
                 ask_user=ask_user,
                 dataset=session["dataset"],
+                provider=provider,
             )
             images = [
                 (path, _image_caption(title, note))

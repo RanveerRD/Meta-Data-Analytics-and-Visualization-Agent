@@ -318,9 +318,9 @@ def test_failed_worker_excluded_from_merge(_tmp_run_dirs):
     merge_inputs: list[str] = []
     real_merge = orchestrator.merge_answers
 
-    def _spy(question, answers, client_, model_):
+    def _spy(question, answers, client_, model_, provider="meta"):
         merge_inputs.extend(a["text"] for a in answers)
-        return real_merge(question, answers, client_, model_)
+        return real_merge(question, answers, client_, model_, provider)
 
     with mock.patch.object(orchestrator, "merge_answers", side_effect=_spy):
         outcome, _, _asked = _run("How many?", _mapping(("b", "a")), client, texts)

@@ -13,7 +13,12 @@ from agent.clarify import (
     interpret_clarification_reply,
 )
 from agent.datasets import REGISTRY
-from agent.loop import REPO_ROOT, answer_question, build_client
+from agent.loop import REPO_ROOT, answer_question
+from agent.provider import (
+    BASENTEN_PRICE_AS_OF,
+    build_client,
+    estimate_cost_usd,
+)
 from agent.record import AnalysisRecord
 from agent.preliminary_analysis import (
     DEFAULT_DATASET,
@@ -424,7 +429,7 @@ def _render_all_outcome(outcome: dict) -> None:
     print(f"Orchestration: {outcome['orchestration_path']}")
 
 
-def _run_all_mode(client, model) -> int:
+def _run_all_mode(client, model, provider: str = "meta") -> int:
     """Ask one question across every dataset via the orchestrator."""
     from agent.orchestrator import run_cross_dataset_question
 
@@ -461,7 +466,7 @@ def _run_all_mode(client, model) -> int:
                 continue
             try:
                 outcome = run_cross_dataset_question(
-                    question, datasets, client, model, _console_ask_user
+                    question, datasets, client, model, _console_ask_user, provider
                 )
             except RuntimeError as exc:
                 print(f"error: {exc}")
@@ -477,12 +482,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     dataset = args.dataset
     try:
-        client, model = build_client()
+        client, model, provider = build_client()
     except RuntimeError as exc:
         print(f"error: {exc}")
         return 2
     if dataset == "all":
-        return _run_all_mode(client, model)
+        return _run_all_mode(client, model, provider)
     try:
         backend = _backend_for_dataset(dataset)
     except RuntimeError as exc:
@@ -517,6 +522,7 @@ def main(argv: list[str] | None = None) -> int:
             client, model, instructions, backend, history, question,
             ask_user=_console_ask_user,
             dataset=dataset,
+            provider=provider,
         )
         if result.text:
             print(result.text)
@@ -535,8 +541,20 @@ def main(argv: list[str] | None = None) -> int:
                 f"tokens: {result.input_tokens} in / "
                 f"{result.output_tokens} out / {result.total_tokens} total"
             )
+            if provider == "baseten":
+                cost = estimate_cost_usd(
+                    result.input_tokens,
+                    result.cached_input_tokens,
+                    result.output_tokens,
+                )
+                print(
+                    f"cost estimate, Baseten list price, {BASENTEN_PRICE_AS_OF}: "
+                    f"${cost:.6f}"
+                )
         else:
             print("tokens: n/a")
+            if provider == "baseten":
+                print("cost unknown")
         if result.record_path:
             print(f"Record: {result.record_path}")
         if result.verification:

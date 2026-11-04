@@ -25,6 +25,7 @@ from agent.loop import (
     answer_question,
     render_answer,
 )
+from agent.provider import chat_round
 from agent.record import AnalysisRecord
 
 ORCHESTRATION_SUFFIX = "-orchestration.json"
@@ -60,6 +61,7 @@ def plan_datasets(
     datasets: dict[str, dict[str, Any]],
     client: Any,
     model: str,
+    provider: str = "meta",
 ) -> tuple[list[str], int]:
     """Ask the planner which datasets to consult; returns (registry-ordered names, tokens)."""
     listing = "\n".join(f"- {name}: {info['description']}" for name, info in datasets.items())
@@ -78,12 +80,17 @@ def plan_datasets(
     while attempts < 2:
         attempts += 1
         body = prompt if attempts == 1 else f"{prompt}\n\nYour previous reply was invalid: {last_error} Reply with JSON only."
-        response = client.responses.create(
-            model=model, instructions="You route questions to datasets. Reply with JSON only.", input=body
+        result = chat_round(
+            client,
+            model,
+            provider,
+            instructions="You route questions to datasets. Reply with JSON only.",
+            tools=[],
+            history=[{"role": "user", "content": body}],
         )
-        tokens += getattr(getattr(response, "usage", None), "total_tokens", 0) or 0
+        tokens += result.total_tokens
         try:
-            plan = json.loads(response.output_text)
+            plan = json.loads(result.text)
         except (json.JSONDecodeError, AttributeError) as exc:
             last_error = f"not valid JSON ({exc})"
             continue
@@ -116,6 +123,7 @@ def merge_answers(
     answers: list[dict[str, str]],
     client: Any,
     model: str,
+    provider: str = "meta",
 ) -> tuple[str, dict[str, Any], int]:
     """Merge worker answers; every number must already appear in them.
 
@@ -140,26 +148,28 @@ def merge_answers(
     ]
     last_unmatched: list[str] = []
     for _ in range(3):
-        response = client.responses.create(
-            model=model,
+        result = chat_round(
+            client,
+            model,
+            provider,
             instructions=history[0]["content"],
             tools=_merge_schemas(),
-            input=history[1:],
+            history=history[1:],
         )
-        total_tokens += getattr(getattr(response, "usage", None), "total_tokens", 0) or 0
+        total_tokens += result.total_tokens
         merged: str | None = None
         use_separate = False
-        for item in getattr(response, "output", []) or []:
-            if getattr(item, "type", "") == "function_call" and getattr(item, "name", "") == "record_merge":
+        for call in result.calls:
+            if call["name"] == "record_merge":
                 try:
-                    args = json.loads(getattr(item, "arguments", "") or "{}")
+                    args = json.loads(call["arguments"] or "{}")
                 except json.JSONDecodeError:
                     continue
                 merged = args.get("merged_text")
                 use_separate = bool(args.get("use_separate"))
                 break
         if merged is None and not use_separate:
-            merged = getattr(response, "output_text", "") or ""
+            merged = result.text or ""
         if use_separate or not (merged or "").strip():
             verification = {"status": "separate", "unmatched": []}
             return "", verification, total_tokens
@@ -207,9 +217,12 @@ def run_cross_dataset_question(
     client: Any,
     model: str,
     ask_user: Any,
+    provider: str = "meta",
 ) -> dict[str, Any]:
     """Plan, run sequential workers, merge; returns everything __main__ renders."""
-    selected, planner_tokens = plan_datasets(question, datasets, client, model)
+    selected, planner_tokens = plan_datasets(
+        question, datasets, client, model, provider
+    )
 
     workers: list[dict[str, Any]] = []
     for name in selected:
@@ -240,6 +253,7 @@ def run_cross_dataset_question(
             ask_user=_scoped_ask_user,
             dataset=name,
             allow_charts=False,
+            provider=provider,
         )
         capped = result.submission is None and CAP_MESSAGE in (result.text or "")
         workers.append(
@@ -265,6 +279,7 @@ def run_cross_dataset_question(
             [{"dataset": w["dataset"], "text": w["submission"]["answer"]} for w in ok],
             client,
             model,
+            provider,
         )
 
     rendered_workers: list[dict[str, Any]] = []
