@@ -15,7 +15,7 @@ from agent.clarify import (
 from agent.datasets import REGISTRY
 from agent.loop import REPO_ROOT, answer_question
 from agent.provider import (
-    BASENTEN_PRICE_AS_OF,
+    BASETEN_PRICE_AS_OF,
     build_client,
     estimate_cost_usd,
 )
@@ -548,7 +548,7 @@ def main(argv: list[str] | None = None) -> int:
                     result.output_tokens,
                 )
                 print(
-                    f"cost estimate, Baseten list price, {BASENTEN_PRICE_AS_OF}: "
+                    f"cost estimate, Baseten list price, {BASETEN_PRICE_AS_OF}: "
                     f"${cost:.6f}"
                 )
         else:
