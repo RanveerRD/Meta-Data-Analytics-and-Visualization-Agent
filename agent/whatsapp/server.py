@@ -20,6 +20,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from agent.clarify import format_options_text, interpret_clarification_reply
+from agent.datasets import REGISTRY
 from agent.whatsapp.client import WhatsAppClient, WhatsAppError
 from agent.whatsapp.config import WhatsAppConfig
 
@@ -29,6 +30,8 @@ _MAX_BODY = 64 * 1024
 _DEDUP_KEEP = 500
 _OWN_COMMAND_REPLY = "Commands are not available on WhatsApp yet."
 _TIMEOUT_LINE = "I did not get an answer, so I stopped this question."
+_PICK_TIMEOUT_LINE = "I did not get a dataset choice, so nothing was started."
+_PICK_STOP_LINE = "I couldn't tell which dataset you meant, so I stopped this question."
 _FAILURE_LINE = "Sorry \u2014 I couldn't finish that question. Please try again."
 
 
@@ -72,12 +75,16 @@ class WhatsAppServer:
         make_answer: Any,
         clarify_timeout: float = 300.0,
         backend_factory: Any = None,
+        datasets: dict[str, dict[str, Any]] | None = None,
+        default_dataset: str | None = None,
     ) -> None:
         self.config = config
         self.client = client
         self.make_answer = make_answer
         self.clarify_timeout = clarify_timeout
         self.backend_factory = backend_factory
+        self.datasets = datasets or REGISTRY
+        self.default_dataset = default_dataset
         self.sessions: dict[str, dict[str, Any]] = {}
         self.lock = threading.Lock()
         self.seen: deque[str] = deque(maxlen=_DEDUP_KEEP)
@@ -189,7 +196,12 @@ class WhatsAppServer:
         return session["inbox"].get()
 
     def _asker(self, sender: str, session: dict[str, Any]) -> Any:
-        """ask_clarification over WhatsApp: prompt, then block for a reply."""
+        """ask_clarification over WhatsApp: prompt, then block for a reply.
+
+        NOTE (accepted): any message arriving while a clarification waits —
+        including "/" commands — is consumed as the clarification reply,
+        exactly like a message sent while the console blocks on input.
+        """
 
         def ask(question: str, options: list[dict[str, Any]]) -> dict[str, str]:
             if not self._send(sender, format_options_text(question, options)):
@@ -228,17 +240,119 @@ class WhatsAppServer:
 
     def _open_backend(self, session: dict[str, Any]) -> Any:
         """Create the session backend in this worker thread. Never shared."""
-        backend = self.backend_factory()
+        backend = self.backend_factory(session["dataset"])
         session["backend"] = backend
         return backend
+
+    def _dataset_list_text(self) -> str:
+        """Numbered dataset list for the picker."""
+        lines = ["Which dataset? Reply with a number:"]
+        for i, (_key, info) in enumerate(self.datasets.items(), 1):
+            lines.append(f"{i}. {info['label']}: {info['description']}")
+        return "\n".join(lines)
+
+    def _parse_pick(self, body: str) -> str | None:
+        """A valid option number picks that dataset; anything else is None."""
+        try:
+            index = int(body.strip())
+        except ValueError:
+            return None
+        names = list(self.datasets)
+        if 1 <= index <= len(names):
+            return names[index - 1]
+        return None
+
+    def _await_pick(
+        self, session: dict[str, Any], sender: str, asked_at: float, held: bool
+    ) -> str | None:
+        """Wait for a valid pick; resend the list once, then stop.
+
+        NOTE (accepted): a second question sent while the picker waits is
+        consumed as the pick reply, exactly like a message sent while a
+        clarification waits is consumed as the clarification reply. The
+        overtake stash below only protects messages that predate the list.
+        """
+        deadline = asked_at + self.clarify_timeout
+        retries = 0
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                arrived, _mid, body = session["inbox"].get(timeout=remaining)
+            except queue.Empty:
+                break
+            if arrived < asked_at:
+                session["overtake"].append((arrived, _mid, body))
+                continue
+            if body.strip() == "/dataset" or body.strip().startswith("/dataset "):
+                asked_at = time.monotonic()
+                deadline = asked_at + self.clarify_timeout
+                retries = 0
+                self._send(sender, self._dataset_list_text())
+                continue
+            name = self._parse_pick(body)
+            if name is not None:
+                return name
+            if retries >= 1:
+                self._send(sender, _PICK_STOP_LINE)
+                return None
+            retries += 1
+            self._send(sender, self._dataset_list_text())
+        self._send(sender, _TIMEOUT_LINE if held else _PICK_TIMEOUT_LINE)
+        return None
+
+    def _ensure_dataset(
+        self, session: dict[str, Any], sender: str, held: str
+    ) -> str | None:
+        """Pick a dataset for the held first question; None when stopped."""
+        self._send(sender, self._dataset_list_text())
+        name = self._await_pick(session, sender, time.monotonic(), held=True)
+        if name is None:
+            return None
+        session["dataset"] = name
+        return name
+
+    def _reset_dataset(self, session: dict[str, Any], sender: str) -> None:
+        """Clear dataset, backend, history and instructions; show the picker."""
+        backend = session.pop("backend", None)
+        if backend is not None:
+            try:
+                backend.close()
+            except Exception:
+                log.exception("session backend close failed for %s", _short(sender))
+        session.pop("dataset", None)
+        session["history"].clear()
+        self._send(sender, self._dataset_list_text())
+        session["pick_pending"] = True
+        session["pick_asked_at"] = time.monotonic()
 
     def _serve_sender(self, sender: str, session: dict[str, Any]) -> None:
         """One sender's turns, strictly one at a time, forever."""
         while True:
+            if session.get("pick_pending"):
+                name = self._await_pick(
+                    session, sender, session["pick_asked_at"], held=False
+                )
+                session.pop("pick_pending", None)
+                if name is not None:
+                    session["dataset"] = name
+                    label = self.datasets[name]["label"]
+                    self._send(sender, f"Using {label}. Ask your question.")
+                continue
             _ts, _mid, body = self._next_message(session)
-            if body.strip().startswith("/"):
+            text = body.strip()
+            if text == "/dataset" or text.startswith("/dataset "):
+                self._reset_dataset(session, sender)
+                continue
+            if text.startswith("/"):
                 self._send(sender, _OWN_COMMAND_REPLY)
                 continue
+            if session.get("dataset") is None:
+                if self.default_dataset is not None:
+                    session["dataset"] = self.default_dataset
+                elif self._ensure_dataset(session, sender, body) is None:
+                    continue
             snapshot = len(session["history"])
             try:
                 if self.backend_factory is not None and "backend" not in session:

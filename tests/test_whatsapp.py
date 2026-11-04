@@ -25,6 +25,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from agent.backend import SqliteBackend  # noqa: E402
 from agent.whatsapp.client import WhatsAppClient, split_body  # noqa: E402
 from agent.whatsapp.config import (  # noqa: E402
     ConfigError,
@@ -125,7 +126,9 @@ def _wait_until(fn, timeout: float = 10.0) -> bool:
     return False
 
 
-def _server(answer=None, timeout: float = 300.0, factory=None, **over: Any):
+def _server(answer=None, timeout: float = 300.0, factory=None,
+            datasets=None, default_dataset: str | None = "olist",
+            **over: Any):
     client = _FakeClient()
     server = WhatsAppServer(
         _config(**over),
@@ -133,6 +136,8 @@ def _server(answer=None, timeout: float = 300.0, factory=None, **over: Any):
         lambda session: answer or _answer("ok"),
         clarify_timeout=timeout,
         backend_factory=factory,
+        datasets=datasets,
+        default_dataset=default_dataset,
     )
     return server, client
 
@@ -320,7 +325,7 @@ def test_missing_config(monkeypatch):
     with pytest.raises(ConfigError, match="not supported"):
         load_config({**env, "WHATSAPP_DATASET": "all"})
     config = load_config(env)
-    assert config.dataset == "olist"
+    assert config.dataset == "ask"
     assert config.allowed_numbers == frozenset({"1555"})
 
 
@@ -583,7 +588,7 @@ def test_real_sqlite_backend_in_worker_thread(tmp_path):
     path = _sqlite_db(tmp_path)
     factory_threads: list[int] = []
 
-    def factory():
+    def factory(_name=None):
         factory_threads.append(threading.get_ident())
         return SqliteBackend(path)
 
@@ -603,7 +608,7 @@ def test_two_senders_query_simultaneously(tmp_path):
     path = _sqlite_db(tmp_path)
     barrier = threading.Barrier(2, timeout=10)
 
-    def factory():
+    def factory(_name=None):
         return SqliteBackend(path)
 
     def make_answer(session):
@@ -638,7 +643,7 @@ def test_factory_failure_then_success(tmp_path):
     path = _sqlite_db(tmp_path)
     attempts: list[int] = []
 
-    def factory():
+    def factory(_name=None):
         attempts.append(1)
         if len(attempts) == 1:
             raise RuntimeError("db down")
@@ -654,6 +659,231 @@ def test_factory_failure_then_success(tmp_path):
     assert client.bodies()[1] == "['items']:[['a'], ['b']]"
     assert len(attempts) == 2
     server.close_sessions()
+
+
+class _TrackedSqlite(SqliteBackend):
+    """Real read-only backend that records close calls.
+
+    Connects lazily so the sqlite connection is created in whichever thread
+    first uses it (the worker thread), never on the creating thread.
+    """
+
+    def __init__(self, path, closed):
+        self._lazy_path = str(path)
+        self._closed_flag = closed
+
+    def _real(self):
+        real = self.__dict__.get("_real_backend")
+        if real is None:
+            real = SqliteBackend(self._lazy_path)
+            self.__dict__["_real_backend"] = real
+        return real
+
+    def __getattr__(self, name):
+        return getattr(self._real(), name)
+
+    def close(self):
+        real = self.__dict__.get("_real_backend")
+        if real is not None:
+            real.close()
+        self._closed_flag.append(True)
+
+
+def _picker_setup(tmp_path):
+    """Two datasets: real temp SQLite under olist, stub sentinel under zz."""
+    from types import SimpleNamespace
+
+    closed: list = []
+    real = _TrackedSqlite(_sqlite_db(tmp_path), closed)
+    sentinel = SimpleNamespace(close=lambda: closed.append("zz"))
+    made: dict[str, int] = {}
+
+    def factory(name: str):
+        made[name] = made.get(name, 0) + 1
+        return {"olist": real, "zz": sentinel}[name]
+
+    datasets = {
+        "olist": {"label": "Olist", "description": "Brazilian orders."},
+        "zz": {"label": "Zed", "description": "Stub data."},
+    }
+    return datasets, factory, made, closed, real
+
+
+def _ds_answer(seen: list):
+    def make_answer(session):
+        def answer(history, question, ask_user):
+            seen.append(
+                {
+                    "dataset": session.get("dataset"),
+                    "backend": session.get("backend"),
+                    "hist_len": len(history),
+                    "question": question,
+                }
+            )
+            history.append(question)
+            backend = session["backend"]
+            tables = backend.list_tables() if hasattr(backend, "list_tables") else []
+            return f"ok:{session.get('dataset')}:{tables}"
+
+        return answer
+
+    return make_answer
+
+
+def test_picker_picks_dataset_and_runs_held_question(tmp_path):
+    import threading
+
+    datasets, factory, made, closed, real = _picker_setup(tmp_path)
+    seen: list = []
+    server, client = _server(datasets=datasets, default_dataset=None, factory=factory)
+    server.make_answer = _ds_answer(seen)
+    assert _post(server, _payload(body="rev?", mid="wamid.p1")) == 200
+    assert _wait_until(lambda: len(client.bodies()) >= 1)
+    assert "1. Olist" in client.bodies()[0] and "2. Zed" in client.bodies()[0]
+    assert _post(server, _payload(body="2", mid="wamid.p2")) == 200
+    assert _wait_until(lambda: len(client.bodies()) >= 2)
+    assert seen[0]["dataset"] == "zz"
+    assert made == {"zz": 1}
+    assert client.bodies()[1].startswith("ok:zz:")
+
+
+def test_picker_invalid_then_valid(tmp_path):
+    datasets, factory, made, closed, real = _picker_setup(tmp_path)
+    seen: list = []
+    server, client = _server(datasets=datasets, default_dataset=None, factory=factory)
+    server.make_answer = _ds_answer(seen)
+    assert _post(server, _payload(body="q", mid="wamid.i1")) == 200
+    assert _wait_until(lambda: len(client.bodies()) >= 1)
+    assert _post(server, _payload(body="xyz", mid="wamid.i2")) == 200
+    assert _wait_until(lambda: len(client.bodies()) >= 2)
+    assert client.bodies()[1].startswith("Which dataset?")
+    assert _post(server, _payload(body="1", mid="wamid.i3")) == 200
+    assert _wait_until(lambda: len(client.bodies()) >= 3)
+    assert seen[0]["dataset"] == "olist"
+    assert seen[0]["backend"] is real
+    assert "items" in client.bodies()[2]
+    assert made == {"olist": 1}
+
+
+def test_picker_factory_runs_off_main_thread(tmp_path):
+    import threading
+
+    factory_threads: list[int] = []
+
+    def factory(name: str):
+        from agent.backend import SqliteBackend
+
+        factory_threads.append(threading.get_ident())
+        return SqliteBackend(_sqlite_db(tmp_path))
+
+    datasets = {
+        "olist": {"label": "Olist", "description": "Brazilian orders."},
+        "zz": {"label": "Zed", "description": "Stub data."},
+    }
+    server, client = _server(datasets=datasets, default_dataset=None, factory=factory)
+    server.make_answer = _ds_answer([])
+    assert _post(server, _payload(body="q", mid="wamid.t1")) == 200
+    assert _wait_until(lambda: len(client.bodies()) >= 1)
+    assert _post(server, _payload(body="1", mid="wamid.t2")) == 200
+    assert _wait_until(lambda: len(client.bodies()) >= 2)
+    assert factory_threads and factory_threads[0] != threading.get_ident()
+
+
+def test_picker_invalid_twice_stops(tmp_path):
+    datasets, factory, made, closed, real = _picker_setup(tmp_path)
+    seen: list = []
+    server, client = _server(datasets=datasets, default_dataset=None, factory=factory)
+    server.make_answer = _ds_answer(seen)
+    assert _post(server, _payload(body="q", mid="wamid.s1")) == 200
+    assert _wait_until(lambda: len(client.bodies()) >= 1)
+    assert _post(server, _payload(body="nope", mid="wamid.s2")) == 200
+    assert _wait_until(lambda: len(client.bodies()) >= 2)
+    assert _post(server, _payload(body="nah", mid="wamid.s3")) == 200
+    assert _wait_until(
+        lambda: any("couldn't tell which dataset" in b for b in client.bodies())
+    )
+    assert seen == [] and made == {}
+
+
+def test_second_question_does_not_ask_again(tmp_path):
+    datasets, factory, made, closed, real = _picker_setup(tmp_path)
+    seen: list = []
+    server, client = _server(datasets=datasets, default_dataset=None, factory=factory)
+    server.make_answer = _ds_answer(seen)
+    assert _post(server, _payload(body="q1", mid="wamid.n1")) == 200
+    assert _wait_until(lambda: len(client.bodies()) >= 1)
+    assert _post(server, _payload(body="1", mid="wamid.n2")) == 200
+    assert _wait_until(lambda: len(client.bodies()) >= 2)
+    assert _post(server, _payload(body="q2", mid="wamid.n3")) == 200
+    assert _wait_until(lambda: len(client.bodies()) >= 3)
+    assert [s["question"] for s in seen] == ["q1", "q2"]
+    assert sum(1 for b in client.bodies() if b.startswith("Which dataset?")) == 1
+
+
+def test_dataset_command_repicks_and_closes(tmp_path):
+    datasets, factory, made, closed, real = _picker_setup(tmp_path)
+    seen: list = []
+    server, client = _server(datasets=datasets, default_dataset=None, factory=factory)
+    server.make_answer = _ds_answer(seen)
+    assert _post(server, _payload(body="q1", mid="wamid.d1")) == 200
+    assert _wait_until(lambda: len(client.bodies()) >= 1)
+    assert _post(server, _payload(body="1", mid="wamid.d2")) == 200
+    assert _wait_until(lambda: len(client.bodies()) >= 2)
+    assert _post(server, _payload(body="/dataset", mid="wamid.d3")) == 200
+    assert _wait_until(lambda: len(client.bodies()) >= 3)
+    assert client.bodies()[2].startswith("Which dataset?")
+    assert closed == [True]
+    assert _post(server, _payload(body="2", mid="wamid.d4")) == 200
+    assert _wait_until(lambda: len(client.bodies()) >= 4)
+    assert client.bodies()[3] == "Using Zed. Ask your question."
+    assert _post(server, _payload(body="q2", mid="wamid.d5")) == 200
+    assert _wait_until(lambda: len(client.bodies()) >= 5)
+    assert [s["dataset"] for s in seen] == ["olist", "zz"]
+    assert [s["hist_len"] for s in seen] == [0, 0]
+    assert made == {"olist": 1, "zz": 1}
+
+
+def test_dataset_pick_timeout_starts_nothing(tmp_path):
+    datasets, factory, made, closed, real = _picker_setup(tmp_path)
+    seen: list = []
+    server, client = _server(
+        datasets=datasets, default_dataset=None, factory=factory, timeout=0.2
+    )
+    server.make_answer = _ds_answer(seen)
+    assert _post(server, _payload(body="/dataset", mid="wamid.e1")) == 200
+    assert _wait_until(
+        lambda: any("nothing was started" in b for b in client.bodies()), timeout=10
+    )
+    assert seen == []
+    assert _post(server, _payload(body="1", mid="wamid.e2")) == 200
+    assert _wait_until(lambda: len(client.bodies()) >= 3)
+    assert client.bodies()[-1].startswith("Which dataset?")
+    assert _post(server, _payload(body="1", mid="wamid.e3")) == 200
+    assert _wait_until(lambda: len(client.bodies()) >= 4)
+    assert seen[0]["dataset"] == "olist"
+
+
+def test_fixed_dataset_skips_picker():
+    server, client = _server()
+    server.make_answer = lambda session: (lambda h, q, a: "fixed-ok")
+    assert _post(server, _payload(body="q", mid="wamid.f1")) == 200
+    assert _wait_until(lambda: len(client.bodies()) >= 1)
+    assert client.bodies() == ["fixed-ok"]
+
+
+def test_config_dataset_defaults_to_ask(monkeypatch):
+    import agent.whatsapp.config as config_mod
+
+    monkeypatch.setattr(config_mod, "_read_env_file_value", lambda name: "")
+    env = {
+        "WHATSAPP_TOKEN": "t",
+        "WHATSAPP_PHONE_NUMBER_ID": "p",
+        "WHATSAPP_APP_SECRET": "s",
+        "WHATSAPP_VERIFY_TOKEN": "v",
+        "WHATSAPP_ALLOWED_NUMBERS": "1555",
+        "WHATSAPP_API_VERSION": "v22.0",
+    }
+    assert load_config(env).dataset == "ask"
 
 
 def test_full_http_round_trip(monkeypatch):

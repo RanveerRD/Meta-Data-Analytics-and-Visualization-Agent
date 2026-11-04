@@ -45,11 +45,11 @@ def main() -> int:
         print(f"error: {exc}")
         return 2
     try:
-        backend = REGISTRY[config.dataset]["make_backend"]()
-        base_instructions = _base_instructions(backend.dialect)
+        _base_instructions("SQLite")  # probe: fail fast if instructions unreadable
     except RuntimeError as exc:
         print(f"error: {exc}")
         return 2
+    base_by_dialect: dict[str, str] = {}
     wa_client = WhatsAppClient(
         config.api_version, config.phone_number_id, config.token
     )
@@ -57,8 +57,12 @@ def main() -> int:
     def make_answer(session: dict) -> Any:
         """Build one session's answer function around its worker-thread backend."""
         session_backend = session["backend"]
+        base_instructions = base_by_dialect.get(session_backend.dialect)
+        if base_instructions is None:
+            base_instructions = _base_instructions(session_backend.dialect)
+            base_by_dialect[session_backend.dialect] = base_instructions
         session_instructions = _instructions_for_question(
-            base_instructions, config.dataset, session_backend.dialect_notes
+            base_instructions, session["dataset"], session_backend.dialect_notes
         )
 
         def answer(history: list, question: str, ask_user) -> str | None:
@@ -70,7 +74,7 @@ def main() -> int:
                 history,
                 question,
                 ask_user=ask_user,
-                dataset=config.dataset,
+                dataset=session["dataset"],
             )
             return format_turn_result(result)
 
@@ -81,9 +85,10 @@ def main() -> int:
         config,
         wa_client,
         make_answer,
-        backend_factory=REGISTRY[config.dataset]["make_backend"],
+        backend_factory=lambda name: REGISTRY[name]["make_backend"](),
+        datasets=REGISTRY,
+        default_dataset=None if config.dataset == "ask" else config.dataset,
     ).serve(HOST, PORT)
-    backend.close()
     return 0
 
 

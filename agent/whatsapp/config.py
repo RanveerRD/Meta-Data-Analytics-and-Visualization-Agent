@@ -53,12 +53,12 @@ def load_config(env: dict | None = None) -> WhatsAppConfig:
     for number in sorted(allowed):
         if not _NUMBER_RE.match(number):
             raise ConfigError("WHATSAPP_ALLOWED_NUMBERS must be digits only")
-    dataset = get("WHATSAPP_DATASET") or "olist"
+    dataset = get("WHATSAPP_DATASET") or "ask"
     if dataset == "all":
         raise ConfigError("WHATSAPP_DATASET 'all' is not supported yet")
-    if dataset not in REGISTRY:
+    if dataset != "ask" and dataset not in REGISTRY:
         known = ", ".join(sorted(REGISTRY))
-        raise ConfigError(f"unknown WHATSAPP_DATASET {dataset!r}; known: {known}")
+        raise ConfigError(f"unknown WHATSAPP_DATASET {dataset!r}; known: {known} (or 'ask')")
     return WhatsAppConfig(
         token=get("WHATSAPP_TOKEN"),
         phone_number_id=get("WHATSAPP_PHONE_NUMBER_ID"),
