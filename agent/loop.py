@@ -83,6 +83,7 @@ class TurnResult:
     submission: dict[str, Any] | None = None
     charts: list[str] = field(default_factory=list)
     chart_notes: list[str] = field(default_factory=list)
+    chart_titles: list[str] = field(default_factory=list)
     chart_candidates: list[dict[str, Any]] = field(default_factory=list)
     chart_drawn: list[str] = field(default_factory=list)
 
@@ -430,6 +431,7 @@ def answer_question(
     chart_entries = ctx.record.charts if ctx.record is not None else []
     chart_paths = [c["path"] for c in chart_entries]
     chart_notes = [c.get("note", "") for c in chart_entries]
+    chart_titles = [c.get("title", "") for c in chart_entries]
     candidates = (
         chart_candidates(ctx.record)
         if ctx.record is not None and ctx.allow_charts and submission is not None
@@ -471,6 +473,7 @@ def answer_question(
         submission=submission,
         charts=chart_paths,
         chart_notes=chart_notes,
+        chart_titles=chart_titles,
         chart_candidates=candidates,
         chart_drawn=drawn,
     )

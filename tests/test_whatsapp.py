@@ -26,7 +26,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from agent.backend import SqliteBackend  # noqa: E402
-from agent.whatsapp.client import WhatsAppClient, split_body  # noqa: E402
+from agent.whatsapp.client import WhatsAppClient, WhatsAppError, split_body  # noqa: E402
 from agent.whatsapp.config import (  # noqa: E402
     ConfigError,
     WhatsAppConfig,
@@ -60,6 +60,7 @@ def _config(**over: Any) -> WhatsAppConfig:
 class _FakeClient:
     def __init__(self) -> None:
         self.sends: list[tuple[str, str]] = []
+        self.images: list[tuple[str, str, str]] = []
         self.lock = threading.Lock()
         self.fail: Exception | None = None
 
@@ -68,6 +69,12 @@ class _FakeClient:
             raise self.fail
         with self.lock:
             self.sends.append((to, body))
+
+    def send_image(self, to: str, path: str, caption: str = "") -> None:
+        if self.fail is not None:
+            raise self.fail
+        with self.lock:
+            self.images.append((to, path, caption))
 
     def bodies(self) -> list[str]:
         with self.lock:
@@ -485,7 +492,7 @@ def test_stalled_connection_closed(monkeypatch):
 def test_format_turn_result():
     submission = {"answer": "x"}
     fake = type("R", (), {"text": "A\nChart: workspace/charts/a.png\nChart note: n\nB", "verification": "verification: 1 matched", "submission": submission})()
-    assert format_turn_result(fake) == "A\nB\nverification: 1 matched"
+    assert format_turn_result(fake) == "A\nChart note: n\nB\nverification: 1 matched"
     assert format_turn_result(type("R", (), {"submission": None, "text": "t", "verification": "v"})()) is None
     assert format_turn_result(None) is None
 
@@ -922,3 +929,283 @@ def test_full_http_round_trip(monkeypatch):
         server.httpd.shutdown()
     assert _wait_until(lambda: client.bodies() == ["hello back"])
     assert calls == ["ping"]
+
+
+class _FakeOpener:
+    """Injectable transport capturing requests and replaying responses."""
+
+    def __init__(self, replies: list) -> None:
+        self.requests: list = []
+        self.replies = list(replies)
+
+    def open(self, request, timeout=None):
+        self.requests.append(request)
+        item = self.replies.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return _FakeResponse(item)
+
+
+class _FakeResponse:
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    def read(self) -> bytes:
+        return self._data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+_PNG = b"\x89PNG\r\n\x1a\n" + b"0" * 100
+
+
+def _chart_file(monkeypatch, tmp_path, name="r1-1.png", data=_PNG):
+    """A real PNG under a fake charts dir; returns the absolute path str."""
+    import agent.whatsapp.client as client_mod
+
+    root = Path(tmp_path).resolve()
+    monkeypatch.setattr(client_mod, "_CHARTS_DIR", root)
+    path = root / name
+    path.write_bytes(data)
+    return str(path)
+
+
+def test_send_image_upload_then_message(monkeypatch, tmp_path):
+    import agent.whatsapp.client as client_mod
+
+    name = _chart_file(monkeypatch, tmp_path)
+    opener = _FakeOpener([b'{"id": "mid-abc123"}', b"{}"])
+    client = WhatsAppClient("v22.0", "pid-9", "tok-secret", opener=opener)
+    client.send_image("15550001111", name, "orders by month")
+    assert len(opener.requests) == 2
+    upload, message = opener.requests
+    assert upload.full_url.endswith("/v22.0/pid-9/media")
+    assert upload.get_header("Authorization") == "Bearer tok-secret"
+    assert upload.get_header("Content-type").startswith("multipart/form-data")
+    raw = upload.data
+    assert b'name="messaging_product"' in raw and b"whatsapp" in raw
+    assert b'name="type"' in raw and b"image/png" in raw
+    assert b'name="file"' in raw and b"Content-Type: image/png" in raw
+    assert _PNG in raw
+    assert b"tok-secret" not in raw
+    assert message.full_url.endswith("/v22.0/pid-9/messages")
+    payload = json.loads(message.data.decode())
+    assert payload["image"] == {"id": "mid-abc123", "caption": "orders by month"}
+    assert payload["to"] == "15550001111"
+
+
+def test_send_image_caption_truncated(monkeypatch, tmp_path):
+    import agent.whatsapp.client as client_mod
+
+    name = _chart_file(monkeypatch, tmp_path)
+    opener = _FakeOpener([b'{"id": "m1"}', b"{}"])
+    client = WhatsAppClient("v22.0", "pid-9", "tok-secret", opener=opener)
+    client.send_image("15550001111", name, "t" * 2000)
+    payload = json.loads(opener.requests[1].data.decode())
+    assert len(payload["image"]["caption"]) == 1024
+
+
+def test_send_image_refuses_outside_charts_dir(monkeypatch, tmp_path):
+    import agent.whatsapp.client as client_mod
+
+    monkeypatch.setattr(client_mod, "_CHARTS_DIR", tmp_path / "charts")
+    opener = _FakeOpener([])
+    client = WhatsAppClient("v22.0", "pid-9", "tok-secret", opener=opener)
+    with pytest.raises(ValueError):
+        client.send_image("15550001111", "/etc/passwd")
+    assert opener.requests == []
+
+
+def test_send_image_refuses_symlink_escape(monkeypatch, tmp_path):
+    import agent.whatsapp.client as client_mod
+
+    charts = Path(tmp_path).resolve() / "charts"
+    charts.mkdir()
+    monkeypatch.setattr(client_mod, "_CHARTS_DIR", charts)
+    outside = Path(tmp_path).resolve() / "evil.png"
+    outside.write_bytes(_PNG)
+    link = charts / "link.png"
+    link.symlink_to(outside)
+    opener = _FakeOpener([])
+    client = WhatsAppClient("v22.0", "pid-9", "tok-secret", opener=opener)
+    with pytest.raises(ValueError):
+        client.send_image("15550001111", str(link))
+    assert opener.requests == []
+
+
+def test_send_image_refuses_non_png(monkeypatch, tmp_path):
+    name = _chart_file(monkeypatch, tmp_path, name="r1-1.txt", data=b"nope")
+    opener = _FakeOpener([])
+    client = WhatsAppClient("v22.0", "pid-9", "tok-secret", opener=opener)
+    with pytest.raises(ValueError):
+        client.send_image("15550001111", name)
+    assert opener.requests == []
+
+
+def test_send_image_refuses_oversize(monkeypatch, tmp_path):
+    import agent.whatsapp.client as client_mod
+
+    name = _chart_file(monkeypatch, tmp_path)
+    monkeypatch.setattr(client_mod, "_MAX_IMAGE_BYTES", 10)
+    opener = _FakeOpener([])
+    client = WhatsAppClient("v22.0", "pid-9", "tok-secret", opener=opener)
+    with pytest.raises(ValueError, match="5 MB"):
+        client.send_image("15550001111", name)
+    assert opener.requests == []
+
+
+def test_send_image_missing_media_id(monkeypatch, tmp_path):
+    name = _chart_file(monkeypatch, tmp_path)
+    opener = _FakeOpener([b"{}"])
+    client = WhatsAppClient("v22.0", "pid-9", "tok-secret", opener=opener)
+    with pytest.raises(WhatsAppError):
+        client.send_image("15550001111", name)
+    assert len(opener.requests) == 1
+
+
+def test_send_image_http_error_hides_token(monkeypatch, tmp_path):
+    import urllib.error
+
+    import agent.whatsapp.client as client_mod
+
+    name = _chart_file(monkeypatch, tmp_path)
+    err = urllib.error.HTTPError(
+        "https://graph.facebook.com/x", 401, "Unauthorized", {}, None
+    )
+    opener = _FakeOpener([err])
+    client = WhatsAppClient("v22.0", "pid-9", "tok-secret", opener=opener)
+    with pytest.raises(WhatsAppError) as caught:
+        client.send_image("15550001111", name)
+    assert "tok-secret" not in str(caught.value)
+
+
+def test_media_id_logged_last4_only(monkeypatch, tmp_path, caplog):
+    import logging
+
+    import agent.whatsapp.client as client_mod
+
+    name = _chart_file(monkeypatch, tmp_path)
+    opener = _FakeOpener([b'{"id": "mid-abcdef12"}', b"{}"])
+    client = WhatsAppClient("v22.0", "pid-9", "tok-secret", opener=opener)
+    with caplog.at_level(logging.INFO, logger="agent.whatsapp.client"):
+        client.send_image("15550001111", name)
+    logged = caplog.text
+    assert "mid-abcdef12" not in logged
+    assert "ef12" in logged
+    assert "tok-secret" not in logged
+
+
+def _tuple_answer(text, images):
+    def make_answer(session):
+        def answer(history, question, ask_user):
+            return text, images
+
+        return answer
+
+    return make_answer
+
+
+def test_tuple_reply_sends_text_then_images():
+    server, client = _server()
+    server.make_answer = _tuple_answer(
+        "answer here", [("workspace/charts/a.png", "cap a"), ("workspace/charts/b.png", "cap b")]
+    )
+    assert _post(server, _payload(body="q?", mid="wamid.img1")) == 200
+    assert _wait_until(lambda: client.bodies() == ["answer here"])
+    assert _wait_until(lambda: len(client.images) == 2)
+    assert client.images[0] == (SENDER, "workspace/charts/a.png", "cap a")
+
+
+def test_tuple_reply_caps_at_three_images():
+    server, client = _server()
+    server.make_answer = _tuple_answer(
+        "t", [(f"workspace/charts/{i}.png", f"c{i}") for i in range(5)]
+    )
+    assert _post(server, _payload(body="q?", mid="wamid.img2")) == 200
+    assert _wait_until(lambda: len(client.images) == 3)
+
+
+def test_image_failure_falls_back_and_session_survives():
+    from agent.whatsapp.client import WhatsAppError
+
+    server, client = _server()
+
+    def bad_send_image(to, path, caption=""):
+        raise WhatsAppError("nope")
+
+    client.send_image = bad_send_image  # type: ignore[method-assign]
+    server.make_answer = _tuple_answer("answer", [("workspace/charts/a.png", "c")])
+    assert _post(server, _payload(body="q?", mid="wamid.img3")) == 200
+    assert _wait_until(
+        lambda: client.bodies()
+        == ["answer", "I drew the chart but could not send the image."]
+    )
+    server.make_answer = lambda session: _answer("fine")
+    assert _post(server, _payload(body="next?", mid="wamid.img4")) == 200
+    assert _wait_until(lambda: "fine" in client.bodies())
+
+
+def test_unsafe_image_skipped_quietly():
+    server, client = _server()
+    real_images = client.images
+
+    def bad_send_image(to, path, caption=""):
+        raise ValueError("refusing")
+
+    client.send_image = bad_send_image  # type: ignore[method-assign]
+    server.make_answer = _tuple_answer("answer", [("/etc/x.png", "c")])
+    assert _post(server, _payload(body="q?", mid="wamid.img5")) == 200
+    assert _wait_until(lambda: client.bodies() == ["answer"])
+    assert real_images == []
+    assert not any("could not send" in b for b in client.bodies())
+
+
+def test_format_turn_result_keeps_chart_note():
+    from agent.whatsapp.server import format_turn_result
+
+    class Result:
+        submission = {"x": 1}
+        text = "Revenue 5.\nChart: workspace/charts/r-1.png\nChart note: no data for June."
+        verification = "verification: 1 numbers matched, 0 unmatched"
+
+    text = format_turn_result(Result())
+    assert "workspace/charts" not in text
+    assert "Chart note: no data for June." in text
+    assert "verification:" in text
+
+
+def test_image_caption_carries_no_path():
+    from agent.whatsapp.__main__ import _image_caption
+
+    caption = _image_caption("orders by month", "Chart note: no data for June")
+    assert ".png" not in caption and "workspace" not in caption
+    assert _image_caption("t", "n" * 2000) != "" and len(_image_caption("t", "n" * 2000)) <= 1024
+
+
+def test_digit_first_message_still_reaches_picker(tmp_path):
+    datasets, factory, made, closed, real = _picker_setup(tmp_path)
+    server, client = _server(datasets=datasets, default_dataset=None, factory=factory)
+    server.make_answer = _ds_answer([])
+    assert _post(server, _payload(body="2", mid="wamid.dg0")) == 200
+    assert _wait_until(
+        lambda: any(b.startswith("Which dataset?") for b in client.bodies())
+    )
+    assert not any("isn't answering anything" in b for b in client.bodies())
+
+
+def test_digit_guard_replies_without_model_turn():
+    server, client = _server()
+    calls: list = []
+    server.make_answer = lambda session: _answer("should not run", calls)
+    assert _post(server, _payload(body="42", mid="wamid.dg1")) == 200
+    assert _wait_until(
+        lambda: any("isn't answering anything" in b for b in client.bodies())
+    )
+    assert calls == []
+    assert _post(server, _payload(body="real question?", mid="wamid.dg2")) == 200
+    assert _wait_until(lambda: "should not run" in client.bodies())
+    assert calls == ["real question?"]

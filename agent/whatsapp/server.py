@@ -32,6 +32,10 @@ _OWN_COMMAND_REPLY = "Commands are not available on WhatsApp yet."
 _TIMEOUT_LINE = "I did not get an answer, so I stopped this question."
 _PICK_TIMEOUT_LINE = "I did not get a dataset choice, so nothing was started."
 _PICK_STOP_LINE = "I couldn't tell which dataset you meant, so I stopped this question."
+_IMAGE_FAILURE_LINE = "I drew the chart but could not send the image."
+_DIGIT_REPLY = (
+    "That number isn't answering anything right now. Please ask your question."
+)
 _FAILURE_LINE = "Sorry \u2014 I couldn't finish that question. Please try again."
 
 
@@ -48,15 +52,18 @@ class _Abandoned(Exception):
 def format_turn_result(result: Any) -> str | None:
     """Compose the WhatsApp reply for a finished turn, or None on failure.
 
-    Sends the answer text plus the verification line. Chart lines name
-    files the user cannot see, so they are dropped. Never raises.
+    Sends the answer text plus the verification line. "Chart:" lines name
+    files the user cannot see, so they are dropped. "Chart note:" lines are
+    kept: the same note also goes in the image caption, and the duplication
+    is deliberate — the text is the backstop if the image send fails.
+    Never raises.
     """
     if result is None or getattr(result, "submission", None) is None:
         return None
     lines = [
         line
         for line in (getattr(result, "text", "") or "").splitlines()
-        if not line.startswith(("Chart: ", "Chart note: "))
+        if not line.startswith("Chart: ")
     ]
     text = "\n".join(lines).strip()
     verification = getattr(result, "verification", "") or ""
@@ -188,6 +195,24 @@ class WhatsAppServer:
             log.warning("send to %s failed: %s", _short(sender), exc)
             return False
         return True
+
+    def _send_images(self, sender: str, images: list) -> None:
+        """Send up to 3 drawn charts after the text answer.
+
+        Unsafe paths are skipped quietly (logged); a failed send gets one
+        short text line. Either way the session stays usable.
+        """
+        failed = False
+        for path, caption in list(images)[:3]:
+            try:
+                self.client.send_image(sender, path, caption)
+            except ValueError:
+                log.warning("skipped un-sendable chart for %s", _short(sender))
+            except WhatsAppError as exc:
+                log.warning("chart image to %s failed: %s", _short(sender), exc)
+                failed = True
+        if failed:
+            self._send(sender, _IMAGE_FAILURE_LINE)
 
     def _next_message(self, session: dict[str, Any]) -> tuple[float, str, str]:
         """Oldest pending message: the overtake stash first, else the inbox."""
@@ -342,6 +367,17 @@ class WhatsAppServer:
                 continue
             _ts, _mid, body = self._next_message(session)
             text = body.strip()
+            picked = (
+                session.get("dataset") is not None or self.default_dataset is not None
+            )
+            if picked and text.isascii() and text.isdigit():
+                # No clarification or picker is waiting here: those consume
+                # digit replies directly from the inbox. A lone number would
+                # otherwise start a model turn that can never succeed. In
+                # ask mode with nothing chosen yet the picker below is the
+                # digit handler, so digits fall through to it.
+                self._send(sender, _DIGIT_REPLY)
+                continue
             if text == "/dataset" or text.startswith("/dataset "):
                 self._reset_dataset(session, sender)
                 continue
@@ -369,11 +405,16 @@ class WhatsAppServer:
                 del session["history"][snapshot:]
                 self._send(sender, _FAILURE_LINE)
                 continue
-            if reply is None:
+            if isinstance(reply, tuple):
+                reply_text, images = reply
+            else:
+                reply_text, images = reply, []
+            if reply_text is None:
                 del session["history"][snapshot:]
                 self._send(sender, _FAILURE_LINE)
                 continue
-            self._send(sender, reply)
+            self._send(sender, reply_text)
+            self._send_images(sender, images)
 
     # -- HTTP routing (thin wrappers; logic stays unit-testable) --
 

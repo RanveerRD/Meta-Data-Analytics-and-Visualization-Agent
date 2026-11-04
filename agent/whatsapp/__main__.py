@@ -23,6 +23,14 @@ def configure_logging() -> None:
     logging.basicConfig(level=logging.INFO, stream=sys.stderr, format=_LOG_FORMAT, force=True)
 
 
+def _image_caption(title: str, note: str) -> str:
+    """Caption for a sent chart: title plus gap note, never a path."""
+    caption = title
+    if note:
+        caption += f" ({note})"
+    return caption[:1024]
+
+
 def startup_line(config) -> str:
     """One startup line; kept exact by the startup test."""
     count = len(config.allowed_numbers)
@@ -55,7 +63,11 @@ def main() -> int:
     )
 
     def make_answer(session: dict) -> Any:
-        """Build one session's answer function around its worker-thread backend."""
+        """Build one session's answer function around its worker-thread backend.
+
+        Returns (reply text, images): images are (path, caption) pairs for
+        charts the model drew this turn; the server sends them after the text.
+        """
         session_backend = session["backend"]
         base_instructions = base_by_dialect.get(session_backend.dialect)
         if base_instructions is None:
@@ -65,7 +77,7 @@ def main() -> int:
             base_instructions, session["dataset"], session_backend.dialect_notes
         )
 
-        def answer(history: list, question: str, ask_user) -> str | None:
+        def answer(history: list, question: str, ask_user):
             result = answer_question(
                 client,
                 model,
@@ -76,7 +88,13 @@ def main() -> int:
                 ask_user=ask_user,
                 dataset=session["dataset"],
             )
-            return format_turn_result(result)
+            images = [
+                (path, _image_caption(title, note))
+                for path, title, note in zip(
+                    result.charts, result.chart_titles, result.chart_notes
+                )
+            ]
+            return format_turn_result(result), images
 
         return answer
 
