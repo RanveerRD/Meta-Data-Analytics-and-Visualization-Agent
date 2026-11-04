@@ -110,6 +110,8 @@ python3 -m venv .venv
 cp .env.example .env     # then fill in META_API_KEY (and ANALYST_READER_PASSWORD for Postgres)
 ```
 
+To run the tests or Datasette, also install `requirements-dev.txt` (see Tests).
+
 Create a Meta Model API key at the Meta Model API developer site and put it in `.env` as `META_API_KEY`. The key is never printed.
 
 ### Using your own database
@@ -159,7 +161,7 @@ After an answer the console offers up to three charts that fit the result; which
 
 **Publishing to a BI tool (`/publish`).** The same recorded SQL can be handed to an open-source BI tool, so the chart becomes interactive. Each dataset names its connector in the registry.
 
-- **Olist → Datasette.** The connector builds a link that opens the query as a chart in Datasette (read-only, no write access). Development-only install: `pip install -r requirements-dev.txt` (Datasette and its chart plugin), then in another terminal `.venv/bin/datasette serve --immutable data/olist.sqlite` (the console prints this hint with your path; Datasette's default address is `http://127.0.0.1:8001`). Set `DATASETTE_URL` if you use another address.
+- **Olist → Datasette.** The connector builds a link that opens the query as a chart in Datasette (read-only, no write access). Development-only install: `.venv/bin/pip install -r requirements-dev.txt` (Datasette and its chart plugin), then in another terminal `.venv/bin/datasette serve --immutable data/olist.sqlite` (the console prints this hint with your path; Datasette's default address is `http://127.0.0.1:8001`). Set `DATASETTE_URL` if you use another address.
 - **AdventureWorks → Metabase.** The connector saves the recorded SQL as a native question through the Metabase API, after a console `y/n` approval. Run Metabase locally with the pinned image: `docker run -d -p 127.0.0.1:3000:3000 --name metabase metabase/metabase:v0.65.2.6`. In Metabase add a PostgreSQL connection named `adventureworks` that uses the `analyst_reader` role (from inside Docker the host is usually `host.docker.internal`), create an API key, and put it in `.env` as `METABASE_API_KEY` (and `METABASE_URL` if not `http://localhost:3000`). The key is read from the environment, is never printed and is never sent through a redirect.
 
 Why two tools: Apache Superset blocks SQLite connections by default and Metabase supports SQLite only through a community driver, so the SQLite dataset uses Datasette and the PostgreSQL dataset uses Metabase.
@@ -197,6 +199,8 @@ Default model: `muse-spark-1.3-contributor` on the Meta Model API (OpenAI-compat
 
 Measured cost for one question is roughly 2–3 US cents at contributor rates (about 200k input tokens and 15–20k output tokens including all rounds). A cross-database question runs two agents plus a planner and a merge step.
 
+Optional open-weight provider: set `MODEL_PROVIDER=baseten` in `.env` to run the open-weight model `meta-models/muse-spark-open-1026` through Baseten's OpenAI-compatible Chat Completions endpoint (`https://inference.baseten.co/v1`, key in `BASETEN_API_KEY`). Baseten reasoning output is never shown or used. Measured on one console question: about US$0.054 at list prices ($1.25 per 1M input tokens, $0.15 per 1M cached input, $4.25 per 1M output); in that test it asked more clarifications and wrote longer answers than the Meta default. The Meta default is the path used and verified for the demo; Baseten is a verified-working option, not the default. The contributor-mode note above applies to the Meta contributor model only.
+
 ## Tests
 
 ```bash
@@ -224,7 +228,7 @@ The suite has 320 passing tests plus 10 that skip when their prerequisites are m
 ## Roadmap
 
 - WhatsApp: reply buttons and list messages for clarifications, a production number and app review, cross-database questions.
-- Open-weight Muse Spark through Baseten as a selectable model provider (in progress).
+- Open-weight Muse Spark through Baseten as a selectable model provider (done: `MODEL_PROVIDER=baseten`).
 - Apache Superset for PostgreSQL sources, and image snapshots of BI charts for messaging.
 - A chat-style web UI.
 - Docker packaging.
