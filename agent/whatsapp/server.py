@@ -47,9 +47,42 @@ _DATASET_PHRASES = frozenset(
         "datasets",
     }
 )
-_FILLER_WORDS = frozenset({"to", "the", "dataset", "database", "use"})
+_FILLER_WORDS = frozenset({"to", "the", "dataset", "database"})
 _SWITCH_VERBS = ("switch", "change", "use")
 _TRIGGER_WORDS = frozenset({"switch", "change", "use", "dataset", "database", "datasets"})
+_DATASET_WORDS = frozenset({"dataset", "datasets", "database"})
+_ABOUT_PHRASES = frozenset(
+    {
+        "help",
+        "what can i ask",
+        "what data do you have",
+        "what datasets are there",
+        "what tables are there",
+        "what tables do you have",
+        "what is in here",
+    }
+)
+_EXAMPLE_QUESTIONS = {
+    "olist": (
+        "how many orders are there?",
+        "show monthly orders in 2017 as a line chart",
+        "what is the top product category?",
+    ),
+    "adventureworks": (
+        "how many orders are there?",
+        "what were total sales in 2024?",
+        "which product has the highest profit margin?",
+    ),
+}
+_GENERIC_EXAMPLES = (
+    "how many rows are there?",
+    "show a monthly trend as a line chart",
+)
+_MAX_ABOUT_TABLES = 15
+_NO_ANSWER_LINE = (
+    "I couldn't answer that from the data. I answer questions with numbers "
+    "from the database, such as counts, totals or trends."
+)
 _FAILURE_LINE = "Sorry \u2014 I couldn't finish that question. Please try again."
 
 
@@ -345,6 +378,8 @@ class WhatsAppServer:
             return ("switch", name) if name is not None else ("picker", None)
         tokens = norm.split()
         trigger = any(token in _TRIGGER_WORDS for token in tokens)
+        mentions_data = any(token in _DATASET_WORDS for token in tokens)
+        command_shaped = norm.startswith(("dataset ", "datasets", "database"))
         core = [token for token in tokens if token not in _FILLER_WORDS]
         had_verb = False
         while core and core[0] in _SWITCH_VERBS:
@@ -352,15 +387,18 @@ class WhatsAppServer:
             had_verb = True
         candidate = self._normalize_identifier(" ".join(core))
         if not candidate:
-            return ("picker", None) if trigger else (None, None)
+            return ("picker", None) if mentions_data else (None, None)
         if candidate.isdigit() and not trigger:
             return (None, None)
         name = self._resolve_dataset(candidate)
         if name is not None:
             return ("switch", name)
-        # Unknown target after a switch verb falls back to the picker; a
-        # question that merely mentions dataset words is left alone.
-        return ("picker", None) if had_verb else (None, None)
+        # An unknown target falls back to the picker only for dataset-shaped
+        # commands ("change dataset to banana", "dataset 9"); chart talk like
+        # "change it to a bar chart" and plain questions go to the agent.
+        if command_shaped or (had_verb and mentions_data):
+            return ("picker", None)
+        return (None, None)
 
     def _await_pick(
         self, session: dict[str, Any], sender: str, asked_at: float, held: bool
@@ -418,6 +456,39 @@ class WhatsAppServer:
             return None
         session["dataset"] = name
         return name
+
+    def _is_about(self, text: str) -> bool:
+        """Whole-message about phrase; one leading slash is allowed for help."""
+        norm = self._normalize_command(text)
+        if norm.startswith("/"):
+            norm = norm[1:]
+        return norm in _ABOUT_PHRASES
+
+    def _about_text(self, session: dict[str, Any]) -> str:
+        """Code-built reply describing the data; never calls the model."""
+        lines = ["I answer questions with numbers from these databases:"]
+        for _key, info in self.datasets.items():
+            lines.append(f"- {info['label']}: {info['description']}")
+        name = session.get("dataset")
+        backend = session.get("backend")
+        if name is not None and backend is not None:
+            try:
+                tables = [str(t) for t in backend.list_tables()]
+            except Exception:
+                tables = []
+            if tables:
+                shown = tables[:_MAX_ABOUT_TABLES]
+                extra = len(tables) - len(shown)
+                line = f"Tables in {self.datasets[name]['label']}: " + ", ".join(shown)
+                if extra > 0:
+                    line += f", ...and {extra} more"
+                lines.append(line)
+        picked = [name] if name in self.datasets else list(self.datasets)
+        lines.append("Try asking:")
+        for key in picked:
+            for example in _EXAMPLE_QUESTIONS.get(key, _GENERIC_EXAMPLES):
+                lines.append(f"- {example}")
+        return "\n".join(lines)
 
     def _confirmation(self, label: str) -> str:
         """Post-pick line; the switch hint only exists in ask mode."""
@@ -491,13 +562,31 @@ class WhatsAppServer:
             if text == "/dataset" or text.startswith("/dataset "):
                 self._reset_dataset(session, sender)
                 continue
+            if session.get("dataset") is None and self.default_dataset is not None:
+                session["dataset"] = self.default_dataset
+            if self._is_about(text):
+                # Code-only reply: no model turn, placed before the "/"
+                # fallback so "/help" works. The backend is opened here in
+                # the worker thread when a dataset is already known, so the
+                # table list is fresh; otherwise that section is omitted.
+                try:
+                    if (
+                        self.backend_factory is not None
+                        and "backend" not in session
+                        and session.get("dataset") is not None
+                    ):
+                        self._open_backend(session)
+                except Exception:
+                    log.exception("about backend failed for %s", _short(sender))
+                    self._send(sender, _FAILURE_LINE)
+                    continue
+                self._send(sender, self._about_text(session))
+                continue
             if text.startswith("/"):
                 self._send(sender, _OWN_COMMAND_REPLY)
                 continue
             if session.get("dataset") is None:
-                if self.default_dataset is not None:
-                    session["dataset"] = self.default_dataset
-                elif self._ensure_dataset(session, sender, body) is None:
+                if self._ensure_dataset(session, sender, body) is None:
                     continue
             snapshot = len(session["history"])
             try:
@@ -521,7 +610,7 @@ class WhatsAppServer:
                 reply_text, images = reply, []
             if reply_text is None:
                 del session["history"][snapshot:]
-                self._send(sender, _FAILURE_LINE)
+                self._send(sender, _NO_ANSWER_LINE)
                 continue
             self._send(sender, reply_text)
             self._send_images(sender, images)

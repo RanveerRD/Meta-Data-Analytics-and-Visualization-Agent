@@ -1301,7 +1301,7 @@ def test_unknown_name_falls_back_to_picker(tmp_path):
     )
     assert _post(server, _payload(body="2", mid="wamid.ux2")) == 200
     assert _wait_until(lambda: client.bodies()[-1].startswith("Using Zed."))
-    assert _post(server, _payload(body="switch to nowhere", mid="wamid.ux3")) == 200
+    assert _post(server, _payload(body="switch dataset to nowhere", mid="wamid.ux3")) == 200
     assert _wait_until(
         lambda: sum(b.startswith("Which dataset?") for b in client.bodies()) >= 3
     )
@@ -1320,6 +1320,173 @@ def test_fixed_mode_confirmation_has_no_hint():
     assert _post(server, _payload(body="1", mid="wamid.fh2")) == 200
     assert _wait_until(lambda: len(client.bodies()) >= 2)
     assert client.bodies()[1] == "Using Olist. Ask your question."
+
+
+_ABOUT_PHRASES_TEST = [
+    "help",
+    "/help",
+    "What can I ask?",
+    "what data do you have",
+    "what datasets are there",
+    "what tables are there",
+    "what tables do you have?",
+    "  what is in here  ",
+]
+
+
+def test_about_phrases_no_model_call():
+    server, client = _server()
+    calls: list = []
+    server.make_answer = lambda session: _answer("must not run", calls)
+    for i, phrase in enumerate(_ABOUT_PHRASES_TEST):
+        assert _post(server, _payload(body=phrase, mid=f"wamid.ab{i}")) == 200
+    assert _wait_until(lambda: len(client.bodies()) == len(_ABOUT_PHRASES_TEST))
+    assert calls == []
+    for body in client.bodies():
+        assert "Olist" in body and "AdventureWorks" in body
+        assert "what is the top product category?" in body
+        assert "what were total sales in 2024?" not in body
+    assert all("Tables in" not in b for b in client.bodies())
+
+
+def test_about_ask_mode_before_pick_no_picker(tmp_path):
+    server, client, seen, made, closed = _ask_server(tmp_path)
+    assert _post(server, _payload(body="help", mid="wamid.ah0")) == 200
+    assert _wait_until(lambda: bool(client.bodies()))
+    text = client.bodies()[0]
+    assert text.startswith("I answer questions")
+    assert "what is the top product category?" in text
+    assert "how many rows are there?" in text
+    assert "Tables in" not in text
+    assert "Which dataset?" not in text
+    assert seen == []
+
+
+def test_match_dataset_command_units():
+    server, _client = _server()
+    match = server._match_dataset_command
+    assert match("switch to adventure works") == ("switch", "adventureworks")
+    assert match("change dataset to banana") == ("picker", None)
+    assert match("olist") == ("switch", "olist")
+    assert match("use olist") == ("switch", "olist")
+    assert match("dataset 2") == ("switch", "adventureworks")
+    for message in [
+        "change it to a bar chart",
+        "switch to a line chart",
+        "change the chart to bar",
+        "change currency to usd",
+        "switch back to monthly",
+        "how many orders in olist?",
+        "which dataset has more orders?",
+        "switch to nowhere",
+        "use blah",
+    ]:
+        assert match(message) == (None, None), message
+
+
+def test_chart_talk_reaches_agent(tmp_path):
+    server, client, seen, made, closed = _ask_server(tmp_path)
+    _pick_first(server, client, seen)
+    messages = [
+        "change it to a bar chart",
+        "switch to a line chart",
+        "change the chart to bar",
+        "change currency to usd",
+        "switch back to monthly",
+        "how many orders in olist?",
+    ]
+    for i, message in enumerate(messages):
+        assert _post(server, _payload(body=message, mid=f"wamid.ct{i}")) == 200
+        assert _wait_until(lambda: len(seen) >= i + 2)
+    assert [s["question"] for s in seen] == ["q"] + messages
+    assert sum(b.startswith("Which dataset?") for b in client.bodies()) == 1
+    assert _post(server, _payload(body="change dataset to banana", mid="wamid.ctb")) == 200
+    assert _wait_until(
+        lambda: sum(b.startswith("Which dataset?") for b in client.bodies()) >= 2
+    )
+    assert _post(server, _payload(body="1", mid="wamid.ctc")) == 200
+    assert _wait_until(lambda: client.bodies()[-1].startswith("Using Olist."))
+    assert _post(server, _payload(body="switch to Zed", mid="wamid.ctd")) == 200
+    assert _wait_until(lambda: client.bodies()[-1].startswith("Using Zed."))
+    assert [s["question"] for s in seen] == ["q"] + messages
+
+
+def test_about_lists_tables(tmp_path):
+    from agent.backend import SqliteBackend
+
+    path = _sqlite_db(tmp_path)
+    server, client = _server(factory=lambda name: SqliteBackend(path))
+    server.make_answer = lambda session: _answer("must not run")
+    assert _post(server, _payload(body="what tables do you have?", mid="wamid.at1")) == 200
+    assert _wait_until(lambda: bool(client.bodies()))
+    text = client.bodies()[0]
+    assert "Tables in Olist: items" in text
+    assert "what is the top product category?" in text
+    assert "what were total sales in 2024?" not in text
+
+
+def test_about_table_cap():
+    from types import SimpleNamespace
+
+    stub = SimpleNamespace(
+        list_tables=lambda: [f"t{i}" for i in range(20)], close=lambda: None
+    )
+    server, client = _server(factory=lambda name: stub)
+    server.make_answer = lambda session: _answer("must not run")
+    assert _post(server, _payload(body="what tables are there", mid="wamid.ac1")) == 200
+    assert _wait_until(lambda: bool(client.bodies()))
+    text = client.bodies()[0]
+    assert "t0" in text and "t14" in text
+    assert "t15" not in text and "t19" not in text
+    assert "...and 5 more" in text
+
+
+def test_about_like_question_reaches_agent():
+    server, client = _server()
+    calls: list = []
+    server.make_answer = lambda session: _answer("ok", calls)
+    question = "what tables are in the orders data?"
+    assert _post(server, _payload(body=question, mid="wamid.aq1")) == 200
+    assert _wait_until(lambda: client.bodies() == ["ok"])
+    assert calls == [question]
+
+
+def test_about_ask_mode_after_pick(tmp_path):
+    server, client, seen, made, closed = _ask_server(tmp_path)
+    _pick_first(server, client, seen)
+    before = len(seen)
+    assert _post(server, _payload(body="help", mid="wamid.ah1")) == 200
+    assert _wait_until(lambda: client.bodies()[-1].startswith("I answer questions"))
+    assert len(seen) == before
+    text = client.bodies()[-1]
+    assert "Tables in Olist: items" in text
+    assert "what is the top product category?" in text
+
+
+def test_no_submission_failure_line():
+    server, client = _server()
+    server.make_answer = lambda session: (lambda h, q, a: (None, []))
+    assert _post(server, _payload(body="q?", mid="wamid.an1")) == 200
+    assert _wait_until(
+        lambda: any("couldn't answer that from the data" in b for b in client.bodies())
+    )
+    assert all("numbers from the database" in b for b in client.bodies())
+
+
+def test_exception_keeps_old_line():
+    server, client = _server()
+
+    def make_answer(session):
+        def answer(history, question, ask_user):
+            raise RuntimeError("boom")
+
+        return answer
+
+    server.make_answer = make_answer
+    assert _post(server, _payload(body="q?", mid="wamid.ae1")) == 200
+    assert _wait_until(
+        lambda: any("couldn't finish that question" in b for b in client.bodies())
+    )
 
 
 def test_digit_guard_replies_without_model_turn():
